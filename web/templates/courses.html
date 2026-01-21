@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="d-sm-flex align-items-center justify-content-between mb-4">
+    <h1 class="h3 mb-0 text-gray-800">课程管理</h1>
+    <button class="btn btn-sm btn-primary shadow-sm" data-bs-toggle="modal" data-bs-target="#addCourseModal">
+        <i class="fas fa-plus fa-sm text-white-50"></i> 新增课程
+    </button>
+</div>
+
+<div class="card shadow mb-4">
+    <div class="card-header py-3">
+        <h6 class="m-0 font-weight-bold text-primary">课程列表</h6>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-bordered" width="100%" cellspacing="0">
+                <thead>
+                    <tr>
+                        <th>课程代码</th>
+                        <th>课程名称</th>
+                        <th>授课教师</th>
+                        <th>上课时间</th>
+                        <th>创建时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for course in courses %}
+                    <tr>
+                        <td>{{ course.code }}</td>
+                        <td>{{ course.name }}</td>
+                        <td>{{ course.teacher }}</td>
+                        <td>{{ course.schedule_time }}</td>
+                        <td>{{ course.created_at.strftime('%Y-%m-%d') }}</td>
+                        <td>
+                            <form action="/api/delete_course" method="post" onsubmit="return confirm('确定删除该课程吗?');" style="display:inline;">
+                                <input type="hidden" name="course_id" value="{{ course.id }}">
+                                <button type="submit" class="btn btn-danger btn-circle btn-sm">
+                                    <i class="fas fa-trash"></i>
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Add Course Modal -->
+<div class="modal fade" id="addCourseModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">新增课程</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <form action="/api/courses" method="post">
+            <div class="mb-3">
+                <label class="form-label">课程代码</label>
+                <input type="text" class="form-control" name="code" required>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">课程名称</label>
+                <input type="text" class="form-control" name="name" required>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">授课教师</label>
+                <input type="text" class="form-control" name="teacher" required>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">上课时间</label>
+                <input type="datetime-local" class="form-control" name="schedule" required>
+            </div>
+            <div class="text-end">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                <button type="submit" class="btn btn-primary">保存</button>
+            </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

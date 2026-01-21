@@ -1,0 +1,198 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h2>👥 学生管理</h2>
+<hr>
+
+<!-- Register Form -->
+<div class="card mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span>新增学生</span>
+        <div>
+            <button type="button" class="btn btn-sm btn-outline-primary me-2" data-bs-toggle="modal" data-bs-target="#importModal">
+                📂 批量导入(Excel)
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-success" data-bs-toggle="modal" data-bs-target="#cameraModal">
+                📷 摄像头拍照注册
+            </button>
+        </div>
+    </div>
+    <div class="card-body">
+        <form action="/api/register" method="post" enctype="multipart/form-data" class="row g-3" id="mainRegForm">
+            <div class="col-md-3">
+                <input type="text" class="form-control" name="name" id="mainName" placeholder="姓名" required>
+            </div>
+            <div class="col-md-3">
+                <input type="text" class="form-control" name="student_id" id="mainId" placeholder="学号" required>
+            </div>
+            <div class="col-md-2">
+                <select class="form-select" name="gender" id="mainGender">
+                    <option value="" selected disabled>性别</option>
+                    <option value="男">男</option>
+                    <option value="女">女</option>
+                </select>
+            </div>
+            <div class="col-md-2">
+                <input type="text" class="form-control" name="class_name" id="mainClass" placeholder="班级">
+            </div>
+            <div class="col-md-2">
+                <input type="text" class="form-control" name="college" id="mainCollege" placeholder="学院">
+            </div>
+            <div class="col-md-10">
+                <input type="file" class="form-control" name="file" id="mainFile" accept="image/*" required>
+            </div>
+            <div class="col-md-2">
+                <button type="submit" class="btn btn-primary w-100">注册</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Camera Modal -->
+<div class="modal fade" id="cameraModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">摄像头拍照注册</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body text-center">
+        <div style="position: relative; width: 640px; height: 480px; margin: 0 auto; background: #000;">
+            <video id="regVideo" autoplay playsinline style="width: 100%; height: 100%; object-fit: cover;"></video>
+            <canvas id="regCanvas" width="640" height="480" style="display: none;"></canvas>
+        </div>
+        <div class="mt-3">
+             <button id="snapBtn" class="btn btn-primary">📸 拍照并填入</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Import Modal -->
+<div class="modal fade" id="importModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">批量导入学生</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <form action="/api/import_students" method="post" enctype="multipart/form-data">
+        <div class="modal-body">
+            <p class="text-muted small">请上传Excel文件 (.xlsx)，包含以下列：姓名, 学号, 性别, 班级, 学院</p>
+            <div class="mb-3">
+                <input class="form-control" type="file" name="file" accept=".xlsx, .xls" required>
+            </div>
+            <div class="mb-3">
+                <a href="/static/template.xlsx" class="small" download>下载模板文件</a>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+            <button type="submit" class="btn btn-primary">开始导入</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Student List -->
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span>已注册学生列表</span>
+        <form class="d-flex" method="get" action="/students">
+            <select class="form-select form-select-sm me-2" name="class_name" style="width: 150px;">
+                <option value="">所有班级</option>
+                {% for c in classes %}
+                <option value="{{ c }}" {% if current_class == c %}selected{% endif %}>{{ c }}</option>
+                {% endfor %}
+            </select>
+            <button class="btn btn-sm btn-outline-secondary" type="submit">筛选</button>
+        </form>
+    </div>
+    <div class="card-body">
+        <table class="table table-striped">
+            <thead>
+                <tr>
+                    <th>编号</th>
+                    <th>姓名</th>
+                    <th>学号</th>
+                    <th>性别</th>
+                    <th>班级</th>
+                    <th>学院</th>
+                    <th>注册时间</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for student in students %}
+                <tr>
+                    <td>{{ student.id }}</td>
+                    <td>{{ student.name }}</td>
+                    <td>{{ student.student_id or '-' }}</td>
+                    <td>{{ student.gender or '-' }}</td>
+                    <td>{{ student.class_name or '-' }}</td>
+                    <td>{{ student.college or '-' }}</td>
+                    <td>{{ student.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>
+                        <form action="/api/delete_student" method="post" onsubmit="return confirm('确定删除吗?');">
+                            <input type="hidden" name="student_id" value="{{ student.id }}">
+                            <button type="submit" class="btn btn-sm btn-danger">删除</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const cameraModal = document.getElementById('cameraModal');
+    const regVideo = document.getElementById('regVideo');
+    const regCanvas = document.getElementById('regCanvas');
+    const snapBtn = document.getElementById('snapBtn');
+    let stream = null;
+
+    cameraModal.addEventListener('shown.bs.modal', async () => {
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+            regVideo.srcObject = stream;
+        } catch (err) {
+            console.error(err);
+            alert("无法启动摄像头");
+        }
+    });
+
+    cameraModal.addEventListener('hidden.bs.modal', () => {
+        if (stream) {
+            stream.getTracks().forEach(t => t.stop());
+            stream = null;
+        }
+    });
+
+    snapBtn.addEventListener('click', () => {
+        if (!stream) return;
+        const ctx = regCanvas.getContext('2d');
+        ctx.drawImage(regVideo, 0, 0, 640, 480);
+        
+        regCanvas.toBlob(blob => {
+            // Create a File object
+            const file = new File([blob], "capture.jpg", { type: "image/jpeg" });
+            
+            // Create a DataTransfer to populate the file input
+            const dataTransfer = new DataTransfer();
+            dataTransfer.items.add(file);
+            document.getElementById('mainFile').files = dataTransfer.files;
+            
+            // Close modal
+            const modalInstance = bootstrap.Modal.getInstance(cameraModal);
+            modalInstance.hide();
+            
+            alert("照片已捕获，请完善其他信息后点击注册按钮。");
+        }, 'image/jpeg');
+    });
+});
+</script>
+{% endblock %}

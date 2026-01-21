@@ -1,0 +1,48 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+env/
+
+# Database (Privacy & Local State)
+*.db
+*.sqlite
+*.sqlite3
+sql_app.db
+
+# Private Data (Photos & User Uploads)
+data/faces/*
+!data/faces/.gitkeep
+web/static/uploads/
+
+# Logs
+*.log
+
+# IDE & System
+.idea/
+.vscode/
+.trae/
+.DS_Store
+Thumbs.db
+
+# Model Weights (Large Binary Files - Download separately)
+models/weights/**/*.pt
+models/weights/**/*.pth
+models/weights/**/*.onnx
+*.pt
+*.pth
+
+# Generated Reports
+*.xlsx
+!web/static/template.xlsx
+attendance_report.xlsx
+
+# Thesis Files
+thesis*.md

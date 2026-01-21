@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h2>🕒 考勤记录</h2>
+<hr>
+
+<div class="row mb-3">
+    <div class="col-md-8">
+        <form class="d-flex" method="get" action="/history">
+            <select class="form-select me-2" name="college" style="width: 200px;">
+                <option value="">所有学院</option>
+                {% for c in colleges %}
+                <option value="{{ c }}" {% if current_college == c %}selected{% endif %}>{{ c }}</option>
+                {% endfor %}
+            </select>
+            <input class="form-control me-2" type="search" name="search_query" placeholder="输入姓名或学号" value="{{ current_search or '' }}" aria-label="Search" style="width: 200px;">
+            <button class="btn btn-outline-primary" type="submit">筛选</button>
+            {% if current_college or current_search %}
+            <a href="/history" class="btn btn-outline-secondary ms-2">重置</a>
+            {% endif %}
+        </form>
+    </div>
+    <div class="col-md-4 text-end">
+        <a href="/api/export_attendance?{% if current_college %}college={{ current_college }}&{% endif %}{% if current_search %}search_query={{ current_search }}{% endif %}" class="btn btn-success">
+            📤 导出 CSV
+        </a>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <table class="table table-hover">
+            <thead>
+                <tr>
+                    <th>姓名</th>
+                    <th>学号</th>
+                    <th>学院</th>
+                    <th>班级</th>
+                    <th>签到时间</th>
+                    <th>状态</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for record in records %}
+                <tr>
+                    <td>{{ record.name }}</td>
+                    <td>{{ record.student_id }}</td>
+                    <td>{{ record.college }}</td>
+                    <td>{{ record.class_name }}</td>
+                    <td>{{ record.timestamp }}</td>
+                    <td><span class="badge bg-success">{{ record.status }}</span></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
