@@ -1,30 +1,23 @@
-# ---------------------------------------------------------
-# 模型配置 (Model Configuration)
-# ---------------------------------------------------------
-
-# 人脸识别模型 (Recognition)
-recognition:
-  backbone_type: "resnet50"
-  embedding_size: 512
-  # 权重文件建议放在 models/weights/recognition/
-  weights_path: "models/weights/recognition/CosFace/best.pth"
-  device: "auto"
-  
-  # 相似度阈值 (Cosine Similarity)
-  # 大于此值判定为同一个人。推荐值: AdaFace(0.25~0.3), ArcFace(0.3~0.4)
-  similarity_threshold: 0.5
-
-# 人脸检测模型 (Detection)
 detector:
-  model_type: "yolo" 
-  model_path: "models/weights/detection/yolo11n-pose.pt"
   conf_threshold: 0.1
-  device: "auto"
-
-# ---------------------------------------------------------
-# 数据预处理 (Preprocessing)
-# ---------------------------------------------------------
+  device: auto
+  model_path: models/weights/detection/yolo13n-pose.pt
+  model_type: yolo
 preprocess:
-  input_size: [112, 112]
-  mean: [0.5, 0.5, 0.5]
-  std: [0.5, 0.5, 0.5]
+  input_size:
+  - 112
+  - 112
+  mean:
+  - 0.5
+  - 0.5
+  - 0.5
+  std:
+  - 0.5
+  - 0.5
+  - 0.5
+recognition:
+  backbone_type: resnet50
+  device: auto
+  embedding_size: 512
+  similarity_threshold: 0.5
+  weights_path: models/weights/recognition/CosFace/best.pth

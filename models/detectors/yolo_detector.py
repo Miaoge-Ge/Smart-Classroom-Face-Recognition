@@ -10,8 +10,6 @@ class YOLOFaceDetector:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         
         if not os.path.exists(model_path):
-            # 这里只是为了防止初始化报错，实际使用时需要确保模型存在
-            # 考虑到用户可能还没下载 YOLO 模型，我们打印警告而不是直接抛出异常
             print(f"Warning: YOLO model not found at {model_path}")
         
         print(f"Loading YOLO Face Detector: {model_path} on {self.device}")
@@ -37,22 +35,6 @@ class YOLOFaceDetector:
             dtype=np.float32,
         )
         
-        # 调整 desired_pts 到 112x112 尺寸 (标准参考点通常基于 112x112)
-        # 如果参考点已经是 112x112 的，则不需要调整。
-        # 你提供的参考点看起来是基于 112x112 的 (y 坐标最大 92)，所以直接使用。
-        # 但是这里有一个关键点顺序的问题。
-        # InsightFace 标准顺序通常是: 左眼, 右眼, 鼻子, 左嘴角, 右嘴角
-        # 你代码里的顺序是:
-        # [41.5493, 92.3655] -> 左嘴角
-        # [70.7299, 92.2041] -> 右嘴角
-        # [56.0252, 71.7366] -> 鼻子
-        # [38.2946, 51.6963] -> 左眼
-        # [73.5318, 51.5014] -> 右眼
-        # 
-        # 而 YOLO 输出的关键点顺序通常也需要确认。
-        # 假设 YOLO 输出顺序是: 左眼, 右眼, 鼻子, 左嘴角, 右嘴角
-        # 那么我们需要调整 desired_pts 的顺序来匹配 YOLO。
-        
         # 标准 InsightFace 顺序 (112x112):
         standard_pts = np.array([
             [38.2946, 51.6963], # 左眼
@@ -71,11 +53,6 @@ class YOLOFaceDetector:
             dst_pts = standard_pts[[0, 1, 2]]
             transform_matrix, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts)
         else:
-            # YOLO Face (5点) 顺序修正
-            # YOLO Output: 0:Left-Mouth, 1:Right-Mouth, 2:Nose, 3:Left-Eye, 4:Right-Eye
-            # Target (InsightFace): 0:Left-Eye, 1:Right-Eye, 2:Nose, 3:Left-Mouth, 4:Right-Mouth
-            
-            # 重排 YOLO 关键点以匹配标准顺序
             reordered_pts = detected_pts[[3, 4, 2, 0, 1]]
             
             transform_matrix, _ = cv2.estimateAffinePartial2D(reordered_pts, standard_pts)

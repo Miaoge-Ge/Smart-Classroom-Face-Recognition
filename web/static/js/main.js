@@ -19,9 +19,23 @@ if (canvas) {
     if (stopBtn) stopBtn.addEventListener('click', stopCamera);
 
     async function startCamera() {
+        console.log("Starting camera...");
         try {
+            // Check for mediaDevices support
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                throw new Error("Browser does not support getUserMedia");
+            }
+            
             stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
             video.srcObject = stream;
+            
+            // Wait for video to be ready
+            await new Promise((resolve) => {
+                video.onloadedmetadata = () => {
+                    video.play();
+                    resolve();
+                };
+            });
             
             // Connect WebSocket
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
