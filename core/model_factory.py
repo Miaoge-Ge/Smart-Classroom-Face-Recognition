@@ -1,5 +1,6 @@
 import torch.nn as nn
 from models.backbones.resnet import ResNet10, ResNet50
+from models.backbones.fastcontextface import fastcontextface
 
 class ModelFactory:
     """
@@ -8,6 +9,7 @@ class ModelFactory:
     _creators = {
         'resnet10': ResNet10,
         'resnet50': ResNet50,
+        'fastcontextface': fastcontextface,
     }
 
     @classmethod

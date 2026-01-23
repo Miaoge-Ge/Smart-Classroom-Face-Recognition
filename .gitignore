@@ -46,3 +46,14 @@ attendance_report.xlsx
 
 # Thesis Files
 thesis*.md
+thesis*.pdf
+thesis*.docx
+thesis/
+*.md
+!README.md
+!GIT_NOTE_SIMPLE.md
+!ultralytics/cfg/models/README.md
+!ultralytics/trackers/README.md
+
+# OSS Scripts
+oss.py

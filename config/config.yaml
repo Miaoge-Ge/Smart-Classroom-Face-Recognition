@@ -1,7 +1,7 @@
 detector:
   conf_threshold: 0.1
   device: auto
-  model_path: models/weights/detection/yolo13n-pose.pt
+  model_path: models/weights/detection/yolo11n-pose.pt
   model_type: yolo
 preprocess:
   input_size:
@@ -20,4 +20,4 @@ recognition:
   device: auto
   embedding_size: 512
   similarity_threshold: 0.5
-  weights_path: models/weights/recognition/CosFace/best.pth
+  weights_path: models/weights/recognition/resnet50/AdaFace.pth
