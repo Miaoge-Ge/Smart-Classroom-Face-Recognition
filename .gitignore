@@ -50,10 +50,25 @@ thesis*.pdf
 thesis*.docx
 thesis/
 *.md
+!docs/**/*.md
 !README.md
 !GIT_NOTE_SIMPLE.md
 !ultralytics/cfg/models/README.md
 !ultralytics/trackers/README.md
 
+# Local Account Vault (Do NOT commit real passwords)
+docs/**/accounts.local.yml
+docs/**/accounts.local.yaml
+docs/**/accounts.local.json
+
 # OSS Scripts
 oss.py
+
+# Secrets
+secrets/
+*.key
+
+# Local SQLite DB
+sql_app.db
+sql_app.db-*
+sql_app.db.bak.*

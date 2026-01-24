@@ -21,6 +21,7 @@
                         <th>课程名称</th>
                         <th>授课教师</th>
                         <th>上课时间</th>
+                        <th>上课地点</th>
                         <th>创建时间</th>
                         <th>操作</th>
                     </tr>
@@ -28,14 +29,15 @@
                 <tbody>
                     {% for course in courses %}
                     <tr>
-                        <td>{{ course.code }}</td>
-                        <td>{{ course.name }}</td>
+                        <td>{{ course.course_no }}</td>
+                        <td>{{ course.course_name }}</td>
                         <td>{{ course.teacher }}</td>
-                        <td>{{ course.schedule_time }}</td>
+                        <td>{{ course.schedule or '-' }}</td>
+                        <td>{{ course.location or '-' }}</td>
                         <td>{{ course.created_at.strftime('%Y-%m-%d') }}</td>
                         <td>
                             <form action="/api/delete_course" method="post" onsubmit="return confirm('确定删除该课程吗?');" style="display:inline;">
-                                <input type="hidden" name="course_id" value="{{ course.id }}">
+                                <input type="hidden" name="course_id" value="{{ course.course_id }}">
                                 <button type="submit" class="btn btn-danger btn-circle btn-sm">
                                     <i class="fas fa-trash"></i>
                                 </button>
@@ -74,6 +76,10 @@
             <div class="mb-3">
                 <label class="form-label">上课时间</label>
                 <input type="datetime-local" class="form-control" name="schedule" required>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">上课地点</label>
+                <input type="text" class="form-control" name="location">
             </div>
             <div class="text-end">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>

@@ -1,0 +1,19 @@
+accounts:
+  - username: admin
+    role: admin
+    full_name: System Admin
+    initial_password: admin123
+    notes: 首次上线请立刻修改密码
+
+  - username: teacher_demo
+    role: teacher
+    full_name: Teacher Demo
+    initial_password: 请在 accounts.local.yml 填写
+    notes: full_name 建议与课程表的授课教师一致
+
+  - username: student_demo
+    role: student
+    full_name: Student Demo
+    student_no: 20250001
+    initial_password: 请在 accounts.local.yml 填写
+    notes: student_no 必须存在于学生表（students.student_no）

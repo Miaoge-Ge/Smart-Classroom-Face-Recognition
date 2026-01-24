@@ -1,23 +1,92 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="card">
-    <div class="card-header bg-primary text-white">
-        <div class="d-flex justify-content-between align-items-center">
-            <span>📹 课堂实时监控</span>
-            <div>
-                <button id="startBtn" class="btn btn-sm btn-success">开启摄像头</button>
-                <button id="stopBtn" class="btn btn-sm btn-danger" disabled>停止</button>
+<div class="row g-3">
+    <div class="col-lg-8">
+        <div class="card shadow">
+            <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+                <div class="fw-bold">实时监控与识别</div>
+                <div class="d-flex align-items-center gap-2">
+                    <span class="badge bg-secondary" id="wsStatusBadge">WS: 断开</span>
+                    <span class="badge bg-secondary" id="fpsBadge">FPS: 0</span>
+                    <span class="badge bg-secondary" id="latencyBadge">延迟: -</span>
+                    <span class="badge bg-secondary" id="processingBadge">处理: -</span>
+                </div>
+            </div>
+            <div class="card-body">
+                <div id="video-container" style="position: relative; width: 640px; height: 480px; margin: 0 auto; background: #000;">
+                    <video id="videoElement" autoplay playsinline muted style="width: 640px; height: 480px; object-fit: contain;"></video>
+                    <canvas id="canvasElement" width="640" height="480" style="position: absolute; top: 0; left: 0; width: 640px; height: 480px; pointer-events: none;"></canvas>
+                </div>
+            </div>
+            <div class="card-footer bg-light">
+                <div class="d-flex flex-wrap gap-2 align-items-center justify-content-between">
+                    <div class="d-flex flex-wrap gap-2 align-items-center">
+                        <button id="startBtn" class="btn btn-success btn-sm">开始监控</button>
+                        <button id="stopBtn" class="btn btn-danger btn-sm" disabled>停止</button>
+                        <select id="cameraSelect" class="form-select form-select-sm" style="width: 240px;">
+                            <option value="">默认摄像头</option>
+                        </select>
+                        <select id="courseSelect" class="form-select form-select-sm" style="width: 220px;">
+                            <option value="">未选择课程</option>
+                            {% for c in courses %}
+                            <option value="{{ c.course_id }}">{{ c.course_name }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="d-flex flex-wrap gap-2 align-items-center">
+                        <a href="/settings" class="btn btn-outline-primary btn-sm">参数设置</a>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
-    <div class="card-body text-center">
-        <div id="video-container" style="position: relative; width: 640px; height: 480px; margin: 0 auto; background: #000;">
-            <video id="videoElement" autoplay playsinline muted style="width: 640px; height: 480px; object-fit: contain;"></video>
-            <canvas id="canvasElement" width="640" height="480" style="position: absolute; top: 0; left: 0; width: 640px; height: 480px; pointer-events: none;"></canvas>
-        </div>
-        <div class="mt-3">
-            <span class="badge bg-success fs-5">已签到人数: <span id="count-badge">0</span></span>
+
+    <div class="col-lg-4">
+        <div class="card shadow h-100">
+            <div class="card-header bg-white">
+                <div class="fw-bold">统计面板</div>
+            </div>
+            <div class="card-body">
+                <div class="row g-2 mb-3">
+                    <div class="col-4">
+                        <div class="border rounded p-2 text-center">
+                            <div class="text-muted small">应到</div>
+                            <div class="fs-5 fw-bold" id="expectedCount">0</div>
+                        </div>
+                    </div>
+                    <div class="col-4">
+                        <div class="border rounded p-2 text-center">
+                            <div class="text-muted small">实到</div>
+                            <div class="fs-5 fw-bold text-success" id="actualCount">0</div>
+                        </div>
+                    </div>
+                    <div class="col-4">
+                        <div class="border rounded p-2 text-center">
+                            <div class="text-muted small">缺勤</div>
+                            <div class="fs-5 fw-bold text-danger" id="absentCount">0</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <div class="fw-bold">缺勤名单</div>
+                    <span class="badge bg-success">已签到: <span id="count-badge">0</span></span>
+                </div>
+                <div class="table-responsive" style="max-height: 420px;">
+                    <table class="table table-sm table-hover align-middle mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th style="width: 45%;">学号</th>
+                                <th style="width: 55%;">姓名</th>
+                            </tr>
+                        </thead>
+                        <tbody id="absentList">
+                            <tr><td colspan="2" class="text-muted">请选择课程并开始监控</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
     </div>
 </div>

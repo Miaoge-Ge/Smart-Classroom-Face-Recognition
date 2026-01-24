@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="d-sm-flex align-items-center justify-content-between mb-4">
+    <h1 class="h3 mb-0 text-gray-800">审计日志</h1>
+</div>
+
+<div class="card shadow mb-4">
+    <div class="card-body">
+        <div class="d-flex flex-wrap gap-2 align-items-center justify-content-between mb-3">
+            <div class="text-muted small">最多显示最近 500 条</div>
+            <div class="d-flex flex-wrap gap-2">
+                <button class="btn btn-outline-success btn-sm" type="button" id="exportSelectedAuditBtn">导出所选</button>
+                <a class="btn btn-outline-success btn-sm" href="/api/audit/export">导出全部</a>
+                <button class="btn btn-danger btn-sm" type="submit" form="auditDeleteForm" id="deleteSelectedAuditBtn">删除所选</button>
+            </div>
+        </div>
+
+        <form id="auditDeleteForm" action="/api/audit/delete" method="post">
+            <div class="table-responsive">
+                <table class="table table-hover align-middle">
+                    <thead>
+                        <tr>
+                            <th style="width: 44px;">
+                                <input class="form-check-input" type="checkbox" id="auditSelectAll">
+                            </th>
+                            <th>时间</th>
+                            <th>用户</th>
+                            <th>角色</th>
+                            <th>动作</th>
+                            <th>资源</th>
+                            <th>状态</th>
+                            <th>IP</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for r in rows %}
+                        <tr>
+                            <td>
+                                <input class="form-check-input audit-row" type="checkbox" name="ids" value="{{ r.id }}">
+                            </td>
+                            <td>{{ r.created_at }}</td>
+                            <td>{{ r.actor_username or '-' }}</td>
+                            <td>{{ r.actor_role or '-' }}</td>
+                            <td>{{ r.action }}</td>
+                            <td>{{ r.resource or '-' }}</td>
+                            <td>{{ r.status or '-' }}</td>
+                            <td>{{ r.ip or '-' }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const selectAll = document.getElementById('auditSelectAll');
+    const rows = Array.from(document.querySelectorAll('input.audit-row'));
+    const exportBtn = document.getElementById('exportSelectedAuditBtn');
+    const deleteBtn = document.getElementById('deleteSelectedAuditBtn');
+    const form = document.getElementById('auditDeleteForm');
+
+    const selectedIds = () => rows.filter(x => x.checked).map(x => x.value);
+
+    if (selectAll) {
+        selectAll.addEventListener('change', () => {
+            rows.forEach(x => { x.checked = selectAll.checked; });
+        });
+    }
+    rows.forEach(x => x.addEventListener('change', () => {
+        if (!selectAll) return;
+        const allChecked = rows.length > 0 && rows.every(y => y.checked);
+        const noneChecked = rows.every(y => !y.checked);
+        selectAll.indeterminate = !allChecked && !noneChecked;
+        selectAll.checked = allChecked;
+    }));
+
+    if (exportBtn) {
+        exportBtn.addEventListener('click', () => {
+            const ids = selectedIds();
+            if (!ids.length) {
+                alert('请先选择要导出的日志');
+                return;
+            }
+            window.location.href = `/api/audit/export?ids=${encodeURIComponent(ids.join(','))}`;
+        });
+    }
+
+    if (form) {
+        form.addEventListener('submit', (e) => {
+            const ids = selectedIds();
+            if (!ids.length) {
+                e.preventDefault();
+                alert('请先选择要删除的日志');
+                return;
+            }
+            if (!confirm(`确定删除选中的 ${ids.length} 条审计日志吗？`)) {
+                e.preventDefault();
+            }
+        });
+    } else if (deleteBtn) {
+        deleteBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+        });
+    }
+});
+</script>
+{% endblock %}

@@ -1,50 +1,57 @@
 {% extends "base.html" %}
 
 {% block content %}
-<h2>👥 学生管理</h2>
-<hr>
-
-<!-- Register Form -->
-<div class="card mb-4">
-    <div class="card-header d-flex justify-content-between align-items-center">
-        <span>新增学生</span>
-        <div>
-            <button type="button" class="btn btn-sm btn-outline-primary me-2" data-bs-toggle="modal" data-bs-target="#importModal">
-                📂 批量导入(Excel)
-            </button>
-            <button type="button" class="btn btn-sm btn-outline-success" data-bs-toggle="modal" data-bs-target="#cameraModal">
-                📷 摄像头拍照注册
-            </button>
-        </div>
+<div class="d-flex align-items-center justify-content-between mb-3">
+    <h2 class="mb-0">学生管理</h2>
+    <div class="d-flex flex-wrap gap-2">
+        <button class="btn btn-primary" type="button" data-bs-toggle="collapse" data-bs-target="#newStudentCollapse">添加学生</button>
+        <button type="button" class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#importModal">批量导入</button>
+        <a class="btn btn-outline-success" href="/api/export_students?{% if current_class %}class_name={{ current_class }}&{% endif %}{% if current_search %}search_query={{ current_search }}&{% endif %}">导出数据</a>
+        <a class="btn btn-outline-secondary" href="/students">刷新</a>
     </div>
-    <div class="card-body">
-        <form action="/api/register" method="post" enctype="multipart/form-data" class="row g-3" id="mainRegForm">
-            <div class="col-md-3">
-                <input type="text" class="form-control" name="name" id="mainName" placeholder="姓名" required>
-            </div>
-            <div class="col-md-3">
-                <input type="text" class="form-control" name="student_id" id="mainId" placeholder="学号" required>
-            </div>
-            <div class="col-md-2">
-                <select class="form-select" name="gender" id="mainGender">
-                    <option value="" selected disabled>性别</option>
-                    <option value="男">男</option>
-                    <option value="女">女</option>
-                </select>
-            </div>
-            <div class="col-md-2">
-                <input type="text" class="form-control" name="class_name" id="mainClass" placeholder="班级">
-            </div>
-            <div class="col-md-2">
-                <input type="text" class="form-control" name="college" id="mainCollege" placeholder="学院">
-            </div>
-            <div class="col-md-10">
-                <input type="file" class="form-control" name="file" id="mainFile" accept="image/*" required>
-            </div>
-            <div class="col-md-2">
-                <button type="submit" class="btn btn-primary w-100">注册</button>
-            </div>
-        </form>
+</div>
+
+<div class="collapse mb-3" id="newStudentCollapse">
+    <div class="card shadow">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <span class="fw-bold">新增学生</span>
+            <button type="button" class="btn btn-sm btn-outline-success" data-bs-toggle="modal" data-bs-target="#cameraModal">摄像头拍照注册</button>
+        </div>
+        <div class="card-body">
+            <form action="/api/register" method="post" enctype="multipart/form-data" class="row g-3" id="mainRegForm">
+                <div class="col-md-3">
+                    <label class="form-label small text-muted">姓名</label>
+                    <input type="text" class="form-control" name="name" id="mainName" required>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label small text-muted">学号</label>
+                    <input type="text" class="form-control" name="student_no" id="mainId" required>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label small text-muted">性别</label>
+                    <select class="form-select" name="gender" id="mainGender">
+                        <option value="" selected>未填写</option>
+                        <option value="男">男</option>
+                        <option value="女">女</option>
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label small text-muted">班级</label>
+                    <input type="text" class="form-control" name="class_name" id="mainClass">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label small text-muted">学院</label>
+                    <input type="text" class="form-control" name="college" id="mainCollege">
+                </div>
+                <div class="col-md-10">
+                    <label class="form-label small text-muted">人脸照片</label>
+                    <input type="file" class="form-control" name="file" id="mainFile" accept="image/*" required>
+                </div>
+                <div class="col-md-2 d-grid">
+                    <button type="submit" class="btn btn-primary">保存</button>
+                </div>
+            </form>
+        </div>
     </div>
 </div>
 
@@ -99,52 +106,132 @@
 <!-- Student List -->
 <div class="card">
     <div class="card-header d-flex justify-content-between align-items-center">
-        <span>已注册学生列表</span>
-        <form class="d-flex" method="get" action="/students">
-            <select class="form-select form-select-sm me-2" name="class_name" style="width: 150px;">
+        <span class="fw-bold">学生列表</span>
+        <form class="d-flex flex-wrap gap-2" method="get" action="/students">
+            <input type="hidden" name="page_size" value="{{ page_size }}">
+            <select class="form-select form-select-sm" name="class_name" style="width: 180px;">
                 <option value="">所有班级</option>
                 {% for c in classes %}
                 <option value="{{ c }}" {% if current_class == c %}selected{% endif %}>{{ c }}</option>
                 {% endfor %}
             </select>
-            <button class="btn btn-sm btn-outline-secondary" type="submit">筛选</button>
+            <input class="form-control form-control-sm" type="search" name="search_query" placeholder="按学号/姓名模糊查询" value="{{ current_search or '' }}" style="width: 220px;">
+            <button class="btn btn-sm btn-outline-primary" type="submit">搜索</button>
         </form>
     </div>
     <div class="card-body">
         <table class="table table-striped">
             <thead>
                 <tr>
-                    <th>编号</th>
-                    <th>姓名</th>
                     <th>学号</th>
-                    <th>性别</th>
+                    <th>姓名</th>
                     <th>班级</th>
+                    <th>性别</th>
                     <th>学院</th>
-                    <th>注册时间</th>
+                    <th>人脸照片</th>
                     <th>操作</th>
                 </tr>
             </thead>
             <tbody>
                 {% for student in students %}
                 <tr>
-                    <td>{{ student.id }}</td>
+                    <td>{{ student.student_no or '-' }}</td>
                     <td>{{ student.name }}</td>
-                    <td>{{ student.student_id or '-' }}</td>
-                    <td>{{ student.gender or '-' }}</td>
                     <td>{{ student.class_name or '-' }}</td>
+                    <td>{{ student.gender or '-' }}</td>
                     <td>{{ student.college or '-' }}</td>
-                    <td>{{ student.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
                     <td>
-                        <form action="/api/delete_student" method="post" onsubmit="return confirm('确定删除吗?');">
-                            <input type="hidden" name="student_id" value="{{ student.id }}">
-                            <button type="submit" class="btn btn-sm btn-danger">删除</button>
-                        </form>
+                        {% if student.face_image_path %}
+                        <img src="/api/student_face?student_id={{ student.student_id }}" style="width: 48px; height: 48px; object-fit: cover; border-radius: 6px;" />
+                        {% else %}
+                        <span class="text-muted small">未注册</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <div class="d-flex gap-2">
+                            <button
+                                class="btn btn-sm btn-outline-primary"
+                                type="button"
+                                data-bs-toggle="modal"
+                                data-bs-target="#editStudentModal"
+                                data-student-id="{{ student.student_id }}"
+                                data-student-no="{{ student.student_no }}"
+                                data-name="{{ student.name }}"
+                                data-gender="{{ student.gender or '' }}"
+                                data-class-name="{{ student.class_name or '' }}"
+                                data-college="{{ student.college or '' }}"
+                            >编辑</button>
+                            <form action="/api/delete_student" method="post" onsubmit="return confirm('确定删除吗?');">
+                                <input type="hidden" name="student_id" value="{{ student.student_id }}">
+                                <button type="submit" class="btn btn-sm btn-danger">删除</button>
+                            </form>
+                        </div>
                     </td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
+
+        <div class="d-flex justify-content-between align-items-center">
+            <div class="text-muted small">共 {{ total_count }} 条，当前第 {{ page }} / {{ total_pages }} 页</div>
+            <div class="btn-group">
+                <a class="btn btn-outline-secondary btn-sm {% if page <= 1 %}disabled{% endif %}"
+                   href="/students?page={{ page - 1 }}&page_size={{ page_size }}{% if current_class %}&class_name={{ current_class }}{% endif %}{% if current_search %}&search_query={{ current_search }}{% endif %}">上一页</a>
+                <a class="btn btn-outline-secondary btn-sm {% if page >= total_pages %}disabled{% endif %}"
+                   href="/students?page={{ page + 1 }}&page_size={{ page_size }}{% if current_class %}&class_name={{ current_class }}{% endif %}{% if current_search %}&search_query={{ current_search }}{% endif %}">下一页</a>
+            </div>
+        </div>
     </div>
+</div>
+
+<div class="modal fade" id="editStudentModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">编辑学生</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <form action="/api/update_student" method="post" enctype="multipart/form-data">
+        <div class="modal-body">
+            <input type="hidden" name="student_id" id="editStudentId">
+            <div class="row g-2">
+                <div class="col-6">
+                    <label class="form-label small text-muted">学号</label>
+                    <input type="text" class="form-control" name="student_no" id="editStudentNo" required>
+                </div>
+                <div class="col-6">
+                    <label class="form-label small text-muted">姓名</label>
+                    <input type="text" class="form-control" name="name" id="editName" required>
+                </div>
+                <div class="col-6">
+                    <label class="form-label small text-muted">性别</label>
+                    <select class="form-select" name="gender" id="editGender">
+                        <option value="">未填写</option>
+                        <option value="男">男</option>
+                        <option value="女">女</option>
+                    </select>
+                </div>
+                <div class="col-6">
+                    <label class="form-label small text-muted">学院</label>
+                    <input type="text" class="form-control" name="college" id="editCollege">
+                </div>
+                <div class="col-12">
+                    <label class="form-label small text-muted">班级</label>
+                    <input type="text" class="form-control" name="class_name" id="editClassName">
+                </div>
+                <div class="col-12">
+                    <label class="form-label small text-muted">更新人脸照片（可选）</label>
+                    <input type="file" class="form-control" name="file" accept="image/*">
+                </div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+            <button type="submit" class="btn btn-primary">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -193,6 +280,27 @@ document.addEventListener('DOMContentLoaded', () => {
             alert("照片已捕获，请完善其他信息后点击注册按钮。");
         }, 'image/jpeg');
     });
+
+    const editModal = document.getElementById('editStudentModal');
+    if (editModal) {
+        editModal.addEventListener('show.bs.modal', (event) => {
+            const button = event.relatedTarget;
+            if (!button) return;
+            const sid = button.getAttribute('data-student-id');
+            const sno = button.getAttribute('data-student-no');
+            const name = button.getAttribute('data-name');
+            const gender = button.getAttribute('data-gender') || '';
+            const cls = button.getAttribute('data-class-name') || '';
+            const college = button.getAttribute('data-college') || '';
+
+            document.getElementById('editStudentId').value = sid || '';
+            document.getElementById('editStudentNo').value = sno || '';
+            document.getElementById('editName').value = name || '';
+            document.getElementById('editGender').value = gender;
+            document.getElementById('editClassName').value = cls;
+            document.getElementById('editCollege').value = college;
+        });
+    }
 });
 </script>
 {% endblock %}

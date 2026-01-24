@@ -4,13 +4,17 @@ import cv2
 import numpy as np
 import base64
 import json
+import asyncio
+import hashlib
+import logging
+import time
 import pandas as pd
 import io
 import yaml
 import glob
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, UploadFile, File, Form, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.requests import Request
@@ -18,6 +22,8 @@ from fastapi.responses import RedirectResponse
 from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 # Security imports
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -29,8 +35,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.face_service import FaceRecognitionService
 from core.database import engine, Base, get_db, SessionLocal
-from core.models import Student, Attendance, AdminUser, Course
+from core.models import Student, Attendance, AdminUser, Course, UserAccount, AuditLog
 from core.config_manager import Config, global_config
+from core.runtime_settings import get_runtime_settings, load_raw_config, save_raw_config
+from core.audit import write_audit_log
+from core.crypto_manager import encrypt_bytes, encrypt_to_b64, decrypt_bytes
+from core.data_access import resolve_course_id, get_teacher_course_ids, build_attendance_query, query_attendance_joined
 
 # Create Tables
 Base.metadata.create_all(bind=engine)
@@ -44,6 +54,438 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # Global Service
 service = None
+logger = logging.getLogger("systems.web")
+
+def _write_attendance_batch_sync(items: list[dict]):
+    db = SessionLocal()
+    try:
+        rows = []
+        for it in items:
+            rows.append(
+                Attendance(
+                    student_id=int(it["student_id"]),
+                    course_id=int(it["course_id"]),
+                    check_time=it.get("check_time") or datetime.now(),
+                    created_at=it.get("created_at") or datetime.now(),
+                    confidence=it.get("confidence"),
+                    status=it.get("status") or "已签到",
+                )
+            )
+        db.add_all(rows)
+        for i in range(3):
+            try:
+                db.commit()
+                return
+            except OperationalError as e:
+                db.rollback()
+                if "locked" in str(e).lower() and i < 2:
+                    time.sleep(0.05 * (2**i))
+                    continue
+                raise
+    finally:
+        db.close()
+
+
+async def _attendance_writer_worker(queue: asyncio.Queue):
+    batch: list[dict] = []
+    last_flush = time.monotonic()
+    while True:
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=0.2)
+            batch.append(item)
+        except asyncio.TimeoutError:
+            item = None
+
+        now = time.monotonic()
+        if batch and (len(batch) >= 50 or (now - last_flush) >= 0.5):
+            await asyncio.to_thread(_write_attendance_batch_sync, batch)
+            batch = []
+            last_flush = now
+
+
+async def _dedup_cleanup_worker(app: FastAPI):
+    while True:
+        await asyncio.sleep(30)
+        cache = getattr(app.state, "dedup_cache", None)
+        lock = getattr(app.state, "dedup_lock", None)
+        if cache is None or lock is None:
+            continue
+        now = datetime.now()
+        max_keep_seconds = int(get_runtime_settings().get("attendance", {}).get("dedup_seconds", 60)) * 20
+        cutoff = now.timestamp() - max(600, max_keep_seconds)
+        async with lock:
+            app.state.dedup_cache = {k: v for k, v in cache.items() if v.timestamp() >= cutoff}
+
+
+def ensure_schema():
+    expected = {
+        "students": {"student_id", "student_no", "name", "class", "college", "gender", "face_image_path", "face_embedding_enc", "created_at"},
+        "courses": {"course_id", "course_no", "course_name", "teacher", "schedule", "location", "created_at"},
+        "attendances": {"record_id", "student_id", "course_id", "check_time", "confidence", "status", "created_at"},
+    }
+
+    def table_cols(conn, table: str) -> set[str]:
+        rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+        return {r[1] for r in rows}
+
+    def has_table(conn, table: str) -> bool:
+        row = conn.execute(
+            text("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:t LIMIT 1"),
+            {"t": table},
+        ).fetchone()
+        return bool(row)
+
+    def user_accounts_fk_ok(conn) -> bool:
+        if not has_table(conn, "user_accounts"):
+            return True
+        try:
+            rows = conn.execute(text("PRAGMA foreign_key_list(user_accounts)")).fetchall()
+        except Exception:
+            return True
+        for r in rows:
+            if len(r) >= 3 and r[2] == "students_old":
+                return False
+            if len(r) >= 3 and r[2] and not has_table(conn, str(r[2])):
+                return False
+            if len(r) >= 7 and r[2] == "students" and str(r[6]).upper() != "SET NULL":
+                return False
+        return True
+
+    def create_target_tables(conn):
+        conn.execute(text("PRAGMA foreign_keys=OFF"))
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS students ("
+                "  student_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  student_no VARCHAR NOT NULL,"
+                "  name VARCHAR NOT NULL,"
+                "  class VARCHAR,"
+                "  college VARCHAR,"
+                "  gender VARCHAR,"
+                "  face_image_path VARCHAR,"
+                "  face_embedding_enc TEXT,"
+                "  created_at DATETIME"
+                ")"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS courses ("
+                "  course_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  course_no VARCHAR NOT NULL,"
+                "  course_name VARCHAR NOT NULL,"
+                "  teacher VARCHAR,"
+                "  schedule VARCHAR,"
+                "  location VARCHAR,"
+                "  created_at DATETIME"
+                ")"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS attendances ("
+                "  record_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  student_id INTEGER NOT NULL,"
+                "  course_id INTEGER NOT NULL,"
+                "  check_time DATETIME,"
+                "  confidence FLOAT,"
+                "  status VARCHAR,"
+                "  created_at DATETIME,"
+                "  FOREIGN KEY(student_id) REFERENCES students(student_id) ON DELETE CASCADE,"
+                "  FOREIGN KEY(course_id) REFERENCES courses(course_id) ON DELETE CASCADE"
+                ")"
+            )
+        )
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_students_student_no ON students(student_no)"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_courses_course_no ON courses(course_no)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_att_student_id ON attendances(student_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_att_course_id ON attendances(course_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_att_check_time ON attendances(check_time)"))
+        conn.execute(text("PRAGMA foreign_keys=ON"))
+
+    with engine.connect() as conn:
+        need_rebuild = False
+        for t, cols in expected.items():
+            if not has_table(conn, t):
+                need_rebuild = True
+                break
+            actual = table_cols(conn, t)
+            if actual != cols:
+                need_rebuild = True
+                break
+
+        fix_user_accounts = not user_accounts_fk_ok(conn)
+
+        if not need_rebuild and not fix_user_accounts:
+            try:
+                with conn.begin():
+                    if has_table(conn, "user_accounts") and has_table(conn, "students"):
+                        conn.execute(
+                            text(
+                                "UPDATE user_accounts SET student_id=NULL "
+                                "WHERE student_id IN (SELECT student_id FROM students WHERE student_no='UNKNOWN')"
+                            )
+                        )
+                    if has_table(conn, "courses"):
+                        conn.execute(text("DELETE FROM courses WHERE course_no='UNKNOWN'"))
+                    if has_table(conn, "students"):
+                        conn.execute(text("DELETE FROM students WHERE student_no='UNKNOWN'"))
+            except Exception:
+                pass
+            return
+
+        db_path = None
+        try:
+            db_path = os.path.abspath(engine.url.database) if engine.url.database else None
+        except Exception:
+            db_path = None
+        if db_path and os.path.exists(db_path):
+            try:
+                import shutil
+
+                backup_pattern = db_path + ".bak.*"
+                existing_backups = []
+                try:
+                    existing_backups = [p for p in glob.glob(backup_pattern) if os.path.isfile(p)]
+                    existing_backups.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                except Exception:
+                    existing_backups = []
+
+                should_backup = True
+                if existing_backups:
+                    try:
+                        last_mtime = os.path.getmtime(existing_backups[0])
+                        should_backup = (time.time() - float(last_mtime)) > (6 * 3600)
+                    except Exception:
+                        should_backup = True
+
+                if should_backup:
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    shutil.copy2(db_path, db_path + f".bak.{ts}")
+
+                try:
+                    keep = 3
+                    for p in existing_backups[keep:]:
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        existing_tables = {
+            r[0] for r in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
+        }
+
+        conn.execute(text("PRAGMA foreign_keys=OFF"))
+        conn.execute(text("BEGIN IMMEDIATE"))
+        try:
+            if "students" in existing_tables:
+                conn.execute(text("ALTER TABLE students RENAME TO students_old"))
+            if "courses" in existing_tables:
+                conn.execute(text("ALTER TABLE courses RENAME TO courses_old"))
+            if "attendances" in existing_tables:
+                conn.execute(text("ALTER TABLE attendances RENAME TO attendances_old"))
+            if "user_accounts" in existing_tables:
+                conn.execute(text("ALTER TABLE user_accounts RENAME TO user_accounts_old"))
+
+            create_target_tables(conn)
+            conn.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS user_accounts ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  username VARCHAR NOT NULL,"
+                    "  hashed_password VARCHAR NOT NULL,"
+                    "  role VARCHAR NOT NULL,"
+                    "  full_name VARCHAR,"
+                    "  student_id INTEGER,"
+                    "  created_at DATETIME,"
+                    "  FOREIGN KEY(student_id) REFERENCES students(student_id) ON DELETE SET NULL"
+                    ")"
+                )
+            )
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_user_accounts_username ON user_accounts(username)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_user_accounts_role ON user_accounts(role)"))
+
+            if "students_old" in {r[0] for r in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}:
+                old_cols = table_cols(conn, "students_old")
+                expr_student_id = "id" if "id" in old_cols else ("student_id" if "student_id" in old_cols else "NULL")
+                parts = []
+                if "student_no" in old_cols:
+                    parts.append("student_no")
+                if "student_id" in old_cols:
+                    parts.append("CAST(student_id AS TEXT)")
+                if "id" in old_cols:
+                    parts.append("CAST(id AS TEXT)")
+                expr_student_no = f"COALESCE({', '.join(parts)})" if len(parts) > 1 else (parts[0] if parts else "CAST(rowid AS TEXT)")
+                expr_name = "name" if "name" in old_cols else "''"
+                expr_class = (
+                    "class" if "class" in old_cols else ("class_name" if "class_name" in old_cols else "NULL")
+                )
+                expr_college = "college" if "college" in old_cols else "NULL"
+                expr_gender = "gender" if "gender" in old_cols else "NULL"
+                expr_face_path = "face_image_path" if "face_image_path" in old_cols else "NULL"
+                expr_face_emb = "face_embedding_enc" if "face_embedding_enc" in old_cols else "NULL"
+                expr_created = "created_at" if "created_at" in old_cols else "NULL"
+
+                conn.execute(
+                    text(
+                        "INSERT INTO students(student_id, student_no, name, class, college, gender, face_image_path, face_embedding_enc, created_at) "
+                        f"SELECT {expr_student_id}, {expr_student_no}, {expr_name}, {expr_class}, {expr_college}, {expr_gender}, {expr_face_path}, {expr_face_emb}, {expr_created} "
+                        "FROM students_old"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "WITH dup AS ("
+                        "  SELECT student_id, student_no,"
+                        "         ROW_NUMBER() OVER (PARTITION BY student_no ORDER BY student_id) AS rn"
+                        "  FROM students"
+                        ") "
+                        "UPDATE students "
+                        "SET student_no = student_no || '-' || student_id "
+                        "WHERE student_id IN (SELECT student_id FROM dup WHERE rn > 1)"
+                    )
+                )
+
+            if "courses_old" in {r[0] for r in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}:
+                old_cols = table_cols(conn, "courses_old")
+                expr_course_id = "id" if "id" in old_cols else ("course_id" if "course_id" in old_cols else "NULL")
+                parts = []
+                if "course_no" in old_cols:
+                    parts.append("course_no")
+                if "code" in old_cols:
+                    parts.append("code")
+                if "id" in old_cols:
+                    parts.append("CAST(id AS TEXT)")
+                expr_course_no = f"COALESCE({', '.join(parts)})" if len(parts) > 1 else (parts[0] if parts else "CAST(rowid AS TEXT)")
+                if "course_name" in old_cols and "name" in old_cols:
+                    expr_course_name = "COALESCE(course_name, name)"
+                elif "course_name" in old_cols:
+                    expr_course_name = "course_name"
+                elif "name" in old_cols:
+                    expr_course_name = "name"
+                else:
+                    expr_course_name = "''"
+                expr_teacher = "teacher" if "teacher" in old_cols else "NULL"
+                if "schedule" in old_cols and "schedule_time" in old_cols:
+                    expr_schedule = "COALESCE(schedule, schedule_time)"
+                elif "schedule" in old_cols:
+                    expr_schedule = "schedule"
+                elif "schedule_time" in old_cols:
+                    expr_schedule = "schedule_time"
+                else:
+                    expr_schedule = "NULL"
+                expr_location = "location" if "location" in old_cols else "NULL"
+                expr_created = "created_at" if "created_at" in old_cols else "NULL"
+
+                conn.execute(
+                    text(
+                        "INSERT INTO courses(course_id, course_no, course_name, teacher, schedule, location, created_at) "
+                        f"SELECT {expr_course_id}, {expr_course_no}, {expr_course_name}, {expr_teacher}, {expr_schedule}, {expr_location}, {expr_created} "
+                        "FROM courses_old"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "WITH dup AS ("
+                        "  SELECT course_id, course_no,"
+                        "         ROW_NUMBER() OVER (PARTITION BY course_no ORDER BY course_id) AS rn"
+                        "  FROM courses"
+                        ") "
+                        "UPDATE courses "
+                        "SET course_no = course_no || '-' || course_id "
+                        "WHERE course_id IN (SELECT course_id FROM dup WHERE rn > 1)"
+                    )
+                )
+
+            if "attendances_old" in {r[0] for r in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}:
+                old_cols = table_cols(conn, "attendances_old")
+                expr_record_id = "id" if "id" in old_cols else ("record_id" if "record_id" in old_cols else "NULL")
+                expr_student_id = "student_id" if "student_id" in old_cols else "NULL"
+                expr_course_id = (
+                    "course_id"
+                    if "course_id" in old_cols
+                    else (
+                        "(SELECT course_id FROM courses WHERE course_name = attendances_old.course_name LIMIT 1)"
+                        if "course_name" in old_cols
+                        else "NULL"
+                    )
+                )
+                if "check_time" in old_cols and "timestamp" in old_cols:
+                    expr_check_time = "COALESCE(check_time, timestamp)"
+                elif "check_time" in old_cols:
+                    expr_check_time = "check_time"
+                elif "timestamp" in old_cols:
+                    expr_check_time = "timestamp"
+                else:
+                    expr_check_time = "NULL"
+
+                if "created_at" in old_cols and "timestamp" in old_cols:
+                    expr_created = "COALESCE(created_at, timestamp)"
+                elif "created_at" in old_cols:
+                    expr_created = "created_at"
+                elif "timestamp" in old_cols:
+                    expr_created = "timestamp"
+                else:
+                    expr_created = "NULL"
+                expr_conf = "confidence" if "confidence" in old_cols else "NULL"
+                expr_status = "status" if "status" in old_cols else "'已签到'"
+
+                conn.execute(
+                    text(
+                        "INSERT INTO attendances(record_id, student_id, course_id, check_time, confidence, status, created_at) "
+                        f"SELECT {expr_record_id}, {expr_student_id}, {expr_course_id}, {expr_check_time}, {expr_conf}, {expr_status}, {expr_created} "
+                        "FROM attendances_old "
+                        f"WHERE ({expr_student_id}) IS NOT NULL AND ({expr_course_id}) IS NOT NULL "
+                        f"AND EXISTS(SELECT 1 FROM students WHERE students.student_id = ({expr_student_id})) "
+                        f"AND EXISTS(SELECT 1 FROM courses WHERE courses.course_id = ({expr_course_id}))"
+                    )
+                )
+
+            if "user_accounts_old" in {r[0] for r in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}:
+                old_cols = table_cols(conn, "user_accounts_old")
+                expr_id = "id" if "id" in old_cols else "NULL"
+                expr_username = "username" if "username" in old_cols else "''"
+                expr_hp = "hashed_password" if "hashed_password" in old_cols else "''"
+                expr_role = "role" if "role" in old_cols else "'student'"
+                expr_full = "full_name" if "full_name" in old_cols else "NULL"
+                if "student_id" in old_cols:
+                    expr_sid = (
+                        "CASE "
+                        "WHEN student_id IS NOT NULL AND EXISTS(SELECT 1 FROM students WHERE students.student_id = user_accounts_old.student_id) "
+                        "THEN user_accounts_old.student_id ELSE NULL END"
+                    )
+                else:
+                    expr_sid = "NULL"
+                expr_created = "created_at" if "created_at" in old_cols else "NULL"
+                conn.execute(
+                    text(
+                        "INSERT INTO user_accounts(id, username, hashed_password, role, full_name, student_id, created_at) "
+                        f"SELECT {expr_id}, {expr_username}, {expr_hp}, {expr_role}, {expr_full}, {expr_sid}, {expr_created} "
+                        "FROM user_accounts_old"
+                    )
+                )
+
+            conn.execute(text("UPDATE user_accounts SET student_id=NULL WHERE student_id IN (SELECT student_id FROM students WHERE student_no='UNKNOWN')"))
+            conn.execute(text("DELETE FROM courses WHERE course_no='UNKNOWN'"))
+            conn.execute(text("DELETE FROM students WHERE student_no='UNKNOWN'"))
+
+            conn.execute(text("DROP TABLE IF EXISTS attendances_old"))
+            conn.execute(text("DROP TABLE IF EXISTS students_old"))
+            conn.execute(text("DROP TABLE IF EXISTS courses_old"))
+            conn.execute(text("DROP TABLE IF EXISTS user_accounts_old"))
+            conn.execute(text("COMMIT"))
+        except Exception:
+            conn.execute(text("ROLLBACK"))
+            raise
+        finally:
+            conn.execute(text("PRAGMA foreign_keys=ON"))
+
+
+ensure_schema()
 
 def init_service():
     global service
@@ -58,31 +500,77 @@ def init_service():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    ensure_schema()
+    app.state.ws_lock = asyncio.Lock()
+    app.state.active_ws = 0
+    app.state.inference_semaphore = None
+    app.state.inference_semaphore_limit = None
+    app.state.attendance_queue = asyncio.Queue(maxsize=5000)
+    app.state.attendance_worker = asyncio.create_task(_attendance_writer_worker(app.state.attendance_queue))
+    app.state.dedup_lock = asyncio.Lock()
+    app.state.dedup_cache = {}
+    app.state.dedup_cleanup = asyncio.create_task(_dedup_cleanup_worker(app))
     # Init Default Admin if not exists
     db = SessionLocal()
-    admin = db.query(AdminUser).filter(AdminUser.username == "admin").first()
-    if not admin:
+    admin_account = db.query(UserAccount).filter(UserAccount.username == "admin").first()
+    if not admin_account:
         hashed = get_password_hash("admin123")
-        new_admin = AdminUser(username="admin", hashed_password=hashed, full_name="System Admin")
-        db.add(new_admin)
+        admin_account = UserAccount(username="admin", hashed_password=hashed, role="admin", full_name="System Admin")
+        db.add(admin_account)
         db.commit()
         print("Default admin created (admin/admin123)")
+
+    legacy_admin = db.query(AdminUser).filter(AdminUser.username == "admin").first()
+    if not legacy_admin:
+        hashed = get_password_hash("admin123")
+        legacy_admin = AdminUser(username="admin", hashed_password=hashed, full_name="System Admin")
+        db.add(legacy_admin)
+        db.commit()
     db.close()
     
     init_service()
     
     yield
     print("Shutdown: Cleaning up...")
+    try:
+        app.state.attendance_worker.cancel()
+    except Exception:
+        pass
+    try:
+        app.state.dedup_cleanup.cancel()
+    except Exception:
+        pass
 
 app = FastAPI(lifespan=lifespan, title="智慧课堂考勤管理系统")
 
 app.mount("/static", StaticFiles(directory="web/static"), name="static")
 templates = Jinja2Templates(directory="web/templates")
 
+
+@app.middleware("http")
+async def https_redirect_middleware(request: Request, call_next):
+    settings = get_runtime_settings()
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    scheme = forwarded_proto or request.url.scheme
+    if settings.get("security", {}).get("force_https"):
+        if scheme != "https":
+            url = request.url.replace(scheme="https")
+            return RedirectResponse(url=str(url), status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+    response = await call_next(request)
+    if scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
 # --- Auth Helpers ---
 
-def create_access_token(data: dict, expires_delta: timedelta | None = None):
-    to_encode = data.copy()
+def create_access_token(
+    username: str,
+    role: str,
+    full_name: str | None = None,
+    student_id: int | None = None,
+    expires_delta: timedelta | None = None,
+):
+    to_encode = {"sub": username, "role": role, "full_name": full_name, "student_id": student_id}
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
@@ -91,24 +579,51 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(request: Request):
+async def get_current_principal(request: Request, db: Session = Depends(get_db)):
     token = request.cookies.get("access_token")
     if not token:
         return None
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
+        username: str | None = payload.get("sub")
+        role: str | None = payload.get("role")
+        if not username:
             return None
-        return username
+
+        if not role:
+            legacy_admin = db.query(AdminUser).filter(AdminUser.username == username).first()
+            if not legacy_admin:
+                return None
+            return {"username": legacy_admin.username, "role": "admin", "full_name": legacy_admin.full_name}
+
+        account = db.query(UserAccount).filter(UserAccount.username == username).first()
+        if not account:
+            legacy_admin = db.query(AdminUser).filter(AdminUser.username == username).first()
+            if legacy_admin and role == "admin":
+                return {"username": legacy_admin.username, "role": "admin", "full_name": legacy_admin.full_name}
+            return None
+
+        return {
+            "username": account.username,
+            "role": account.role,
+            "full_name": account.full_name,
+            "student_id": account.student_id,
+        }
     except JWTError:
         return None
 
-async def login_required(request: Request):
-    user = await get_current_user(request)
-    if not user:
+async def login_required(principal=Depends(get_current_principal)):
+    if not principal:
         raise HTTPException(status_code=status.HTTP_307_TEMPORARY_REDIRECT, headers={"Location": "/login"})
-    return user
+    return principal
+
+def require_roles(*roles: str):
+    async def dep(principal=Depends(login_required)):
+        if principal.get("role") not in set(roles):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限访问该资源")
+        return principal
+
+    return dep
 
 # --- Pages ---
 
@@ -118,29 +633,89 @@ async def login_page(request: Request):
 
 @app.post("/login")
 async def login_submit(request: Request, db: Session = Depends(get_db), username: str = Form(...), password: str = Form(...)):
-    user = db.query(AdminUser).filter(AdminUser.username == username).first()
-    if not user or not verify_password(password, user.hashed_password):
-        return templates.TemplateResponse("login.html", {"request": request, "error": "用户名或密码错误"})
-    
-    access_token = create_access_token(data={"sub": user.username})
-    response = RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
-    response.set_cookie(key="access_token", value=access_token, httponly=True)
-    return response
+    account = db.query(UserAccount).filter(UserAccount.username == username).first()
+    if account and verify_password(password, account.hashed_password):
+        access_token = create_access_token(
+            username=account.username, role=account.role, full_name=account.full_name, student_id=account.student_id
+        )
+        redirect_url = "/dashboard" if account.role in {"admin", "teacher"} else "/my_attendance"
+        response = RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+        response.set_cookie(
+            key="access_token",
+            value=access_token,
+            httponly=True,
+            samesite="lax",
+            secure=(request.url.scheme == "https"),
+        )
+        write_audit_log(
+            actor_username=account.username,
+            actor_role=account.role,
+            action="login",
+            resource="/login",
+            status="success",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+        return response
+
+    legacy_admin = db.query(AdminUser).filter(AdminUser.username == username).first()
+    if legacy_admin and verify_password(password, legacy_admin.hashed_password):
+        access_token = create_access_token(username=legacy_admin.username, role="admin", full_name=legacy_admin.full_name)
+        response = RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
+        response.set_cookie(
+            key="access_token",
+            value=access_token,
+            httponly=True,
+            samesite="lax",
+            secure=(request.url.scheme == "https"),
+        )
+        write_audit_log(
+            actor_username=legacy_admin.username,
+            actor_role="admin",
+            action="login",
+            resource="/login",
+            status="success",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+        return response
+
+    write_audit_log(
+        actor_username=username,
+        actor_role=None,
+        action="login",
+        resource="/login",
+        status="failed",
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    return templates.TemplateResponse("login.html", {"request": request, "error": "用户名或密码错误"})
 
 @app.get("/logout")
-async def logout():
+async def logout(request: Request, user=Depends(login_required)):
     response = RedirectResponse(url="/login", status_code=status.HTTP_302_FOUND)
     response.delete_cookie("access_token")
+    write_audit_log(
+        actor_username=user.get("username"),
+        actor_role=user.get("role"),
+        action="logout",
+        resource="/logout",
+        status="success",
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
     return response
 
 @app.get("/dashboard")
 async def dashboard_page(request: Request, user=Depends(login_required), db: Session = Depends(get_db)):
+    if user.get("role") == "student":
+        return RedirectResponse(url="/my_attendance", status_code=status.HTTP_302_FOUND)
     # Statistics
     total_students = db.query(Student).count()
     total_courses = db.query(Course).count()
     
     today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    today_attendance = db.query(Attendance.student_id).filter(Attendance.timestamp >= today_start).distinct().count()
+    today_attendance = db.query(Attendance.student_id).filter(Attendance.check_time >= today_start).distinct().count()
     
     # Calculate Real-time Rate (Today)
     # If total_students is 0, avoid division by zero
@@ -156,12 +731,17 @@ async def dashboard_page(request: Request, user=Depends(login_required), db: Ses
     for i in range(6, -1, -1):
         day = today_start - timedelta(days=i)
         next_day = day + timedelta(days=1)
-        cnt = db.query(Attendance.student_id).filter(Attendance.timestamp >= day, Attendance.timestamp < next_day).distinct().count()
+        cnt = (
+            db.query(Attendance.student_id)
+            .filter(Attendance.check_time >= day, Attendance.check_time < next_day)
+            .distinct()
+            .count()
+        )
         dates.append(day.strftime("%m-%d"))
         counts.append(cnt)
         
     # Pie Chart (Colleges)
-    colleges_stats = db.query(Student.college, func.count(Student.id)).group_by(Student.college).all()
+    colleges_stats = db.query(Student.college, func.count(Student.student_id)).group_by(Student.college).all()
     college_names = [c[0] if c[0] else "Unknown" for c in colleges_stats]
     college_counts = [c[1] for c in colleges_stats]
     
@@ -181,148 +761,380 @@ async def dashboard_page(request: Request, user=Depends(login_required), db: Ses
     
     return templates.TemplateResponse("dashboard.html", {
         "request": request, 
-        "user": {"username": user},
+        "user": user,
         "stats": stats,
         "chart_data": chart_data,
         "title": "仪表盘"
     })
 
 @app.get("/")
-async def index(request: Request, user=Depends(login_required)):
-    return templates.TemplateResponse("index.html", {"request": request, "user": {"username": user}, "title": "实时监控"})
+async def index(request: Request, user=Depends(require_roles("admin", "teacher")), db: Session = Depends(get_db)):
+    if user.get("role") == "teacher":
+        teacher_key = user.get("full_name") or user.get("username")
+        courses = db.query(Course).filter(Course.teacher == teacher_key, Course.course_no != "UNKNOWN").all()
+    else:
+        courses = db.query(Course).filter(Course.course_no != "UNKNOWN").all()
+
+    return templates.TemplateResponse("index.html", {"request": request, "user": user, "courses": courses, "title": "实时监控"})
+
+@app.get("/my_attendance")
+async def my_attendance_page(request: Request, user=Depends(require_roles("student")), db: Session = Depends(get_db)):
+    student_id = user.get("student_id")
+    records = []
+    if student_id:
+        rows = (
+            db.query(Attendance, Course)
+            .outerjoin(Course, Attendance.course_id == Course.course_id)
+            .filter(Attendance.student_id == student_id)
+            .order_by(Attendance.check_time.desc())
+            .limit(200)
+            .all()
+        )
+        for r, c in rows:
+            course_label = c.course_name if c else "-"
+            ts = r.check_time
+            records.append(
+                {
+                    "course_name": course_label,
+                    "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "-",
+                    "status": r.status,
+                }
+            )
+
+    return templates.TemplateResponse(
+        "my_attendance.html",
+        {"request": request, "user": user, "records": records, "title": "我的考勤"},
+    )
+
+@app.get("/my_courses")
+async def my_courses_page(request: Request, user=Depends(require_roles("teacher")), db: Session = Depends(get_db)):
+    teacher_key = user.get("full_name") or user.get("username")
+    courses = db.query(Course).filter(Course.teacher == teacher_key).all()
+    course_rows = []
+    for c in courses:
+        total_records = db.query(Attendance).filter(Attendance.course_id == c.course_id).count()
+        unique_students = (
+            db.query(Attendance.student_id).filter(Attendance.course_id == c.course_id).distinct().count()
+        )
+        course_rows.append(
+            {
+                "id": c.course_id,
+                "name": c.course_name,
+                "code": c.course_no,
+                "schedule_time": c.schedule or "-",
+                "total_records": total_records,
+                "unique_students": unique_students,
+            }
+        )
+
+    return templates.TemplateResponse(
+        "my_courses.html",
+        {"request": request, "user": user, "courses": course_rows, "title": "我的课程"},
+    )
 
 @app.get("/students")
-async def students_page(request: Request, class_name: str = None, user=Depends(login_required), db: Session = Depends(get_db)):
+async def students_page(
+    request: Request,
+    class_name: str = None,
+    search_query: str = None,
+    page: int = 1,
+    page_size: int = 20,
+    user=Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    from sqlalchemy import or_
+
+    try:
+        page = int(page)
+    except Exception:
+        page = 1
+    page = max(1, page)
+    try:
+        page_size = int(page_size)
+    except Exception:
+        page_size = 20
+    page_size = min(200, max(10, page_size))
+
     query = db.query(Student)
+    query = query.filter(Student.student_no != "UNKNOWN")
     if class_name:
         query = query.filter(Student.class_name == class_name)
-    students = query.all()
+    if search_query:
+        q = search_query.strip()
+        if q:
+            query = query.filter(or_(Student.name.like(f"%{q}%"), Student.student_no.like(f"%{q}%")))
+
+    total_count = query.count()
+    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    page = min(page, total_pages)
+
+    students = (
+        query.order_by(Student.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
     
     classes = db.query(Student.class_name).distinct().all()
     classes = [c[0] for c in classes if c[0]]
     
-    return templates.TemplateResponse("students.html", {
-        "request": request, 
-        "students": students, 
-        "classes": classes,
-        "current_class": class_name,
-        "user": {"username": user},
-        "title": "学生管理"
-    })
+    return templates.TemplateResponse(
+        "students.html",
+        {
+            "request": request,
+            "students": students,
+            "classes": classes,
+            "current_class": class_name,
+            "current_search": search_query,
+            "page": page,
+            "page_size": page_size,
+            "total_count": total_count,
+            "total_pages": total_pages,
+            "user": user,
+            "title": "学生管理",
+        },
+    )
 
 @app.get("/history")
 async def history_page(
     request: Request, 
     college: str = None, 
     search_query: str = None, 
-    user=Depends(login_required),
+    course_id: int = None,
+    course_name: str = None,
+    start_date: str = None,
+    end_date: str = None,
+    page: int = 1,
+    page_size: int = 20,
+    user=Depends(require_roles("admin", "teacher")),
     db: Session = Depends(get_db)
 ):
-    query = db.query(Attendance).join(Student).order_by(Attendance.timestamp.desc())
-    
-    if college:
-        query = query.filter(Student.college == college)
-        
-    if search_query:
-        from sqlalchemy import or_
-        query = query.filter(
-            or_(
-                Student.name.like(f"%{search_query}%"),
-                Student.student_id == search_query
-            )
-        )
-        
-    records = query.limit(500).all()
+    if not course_id and course_name:
+        course_id = resolve_course_id(db, course_name)
+
+    teacher_course_ids = None
+    if user.get("role") == "teacher":
+        teacher_key = user.get("full_name") or user.get("username")
+        teacher_course_ids = get_teacher_course_ids(db, teacher_key)
+
+    try:
+        page = int(page)
+    except Exception:
+        page = 1
+    page = max(1, page)
+    try:
+        page_size = int(page_size)
+    except Exception:
+        page_size = 20
+    page_size = min(200, max(10, page_size))
+
+    start_time = None
+    end_time = None
+    if start_date:
+        try:
+            start_time = datetime.fromisoformat(start_date).replace(hour=0, minute=0, second=0, microsecond=0)
+        except Exception:
+            start_time = None
+    if end_date:
+        try:
+            end_time = datetime.fromisoformat(end_date).replace(hour=23, minute=59, second=59, microsecond=999999)
+        except Exception:
+            end_time = None
+
+    base_q = build_attendance_query(
+        db,
+        course_id=course_id,
+        teacher_course_ids=teacher_course_ids,
+        college=college,
+        search_query=search_query,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    total_count = base_q.count()
+    distinct_students = base_q.with_entities(Attendance.student_id).distinct().count()
+    avg_confidence = base_q.with_entities(func.avg(Attendance.confidence)).scalar()
+    expected_count = db.query(Student.student_id).count()
+    attendance_rate = int((distinct_students / expected_count) * 100) if expected_count else 0
+
+    records = (
+        base_q.offset((page - 1) * page_size).limit(page_size).all()
+    )
     
     history_data = []
-    for r in records:
+    for a, s, c in records:
+        ts = a.check_time
         history_data.append({
-            "name": r.student.name,
-            "student_id": r.student.student_id or "-",
-            "class_name": r.student.class_name or "-",
-            "college": r.student.college or "-",
-            "timestamp": r.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            "status": r.status
+            "record_id": a.record_id,
+            "name": s.name,
+            "student_id": s.student_no or "-",
+            "class_name": s.class_name or "-",
+            "college": s.college or "-",
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "-",
+            "status": a.status,
+            "course_name": c.course_name if c else "-",
+            "confidence": a.confidence,
         })
         
     colleges = db.query(Student.college).distinct().all()
     colleges = [c[0] for c in colleges if c[0]]
+    courses = (
+        db.query(Course).filter(Course.course_no != "UNKNOWN").all()
+        if user.get("role") == "admin"
+        else db.query(Course)
+        .filter(Course.teacher == (user.get("full_name") or user.get("username")), Course.course_no != "UNKNOWN")
+        .all()
+    )
 
     return templates.TemplateResponse("history.html", {
         "request": request, 
         "records": history_data, 
         "colleges": colleges,
+        "courses": courses,
         "current_college": college,
+        "current_course_id": course_id,
         "current_search": search_query,
-        "user": {"username": user},
+        "current_start_date": start_date,
+        "current_end_date": end_date,
+        "stats": {
+            "total_count": total_count,
+            "attendance_rate": attendance_rate,
+            "avg_confidence": float(avg_confidence) if avg_confidence is not None else None,
+        },
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total_count + page_size - 1) // page_size),
+        "user": user,
         "title": "考勤记录"
     })
 
 @app.get("/courses")
-async def courses_page(request: Request, user=Depends(login_required), db: Session = Depends(get_db)):
-    courses = db.query(Course).all()
+async def courses_page(request: Request, user=Depends(require_roles("admin")), db: Session = Depends(get_db)):
+    courses = db.query(Course).filter(Course.course_no != "UNKNOWN").all()
     return templates.TemplateResponse("courses.html", {
         "request": request, 
         "courses": courses,
-        "user": {"username": user},
+        "user": user,
         "title": "课程管理"
     })
 
 @app.post("/api/courses")
 async def add_course(
+    request: Request,
     name: str = Form(...),
     code: str = Form(...),
     teacher: str = Form(...),
     schedule: str = Form(...),
+    location: str = Form(None),
     db: Session = Depends(get_db),
-    user=Depends(login_required)
+    user=Depends(require_roles("admin"))
 ):
     try:
-        course = Course(name=name, code=code, teacher=teacher, schedule_time=schedule)
+        course = Course(
+            course_name=name,
+            course_no=code,
+            schedule=schedule,
+            location=location,
+            teacher=teacher,
+        )
         db.add(course)
         db.commit()
+        write_audit_log(
+            actor_username=user.get("username"),
+            actor_role=user.get("role"),
+            action="create_course",
+            resource="/api/courses",
+            status="success",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"name": name, "code": code, "teacher": teacher, "schedule": schedule, "location": location},
+        )
         return RedirectResponse(url="/courses", status_code=303)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 @app.post("/api/delete_course")
-async def delete_course(course_id: int = Form(...), db: Session = Depends(get_db), user=Depends(login_required)):
-    course = db.query(Course).filter(Course.id == course_id).first()
+async def delete_course(request: Request, course_id: int = Form(...), db: Session = Depends(get_db), user=Depends(require_roles("admin"))):
+    course = db.query(Course).filter(Course.course_id == course_id).first()
     if course:
+        deleted = {"id": course.course_id, "name": course.course_name, "code": course.course_no}
         db.delete(course)
         db.commit()
+        write_audit_log(
+            actor_username=user.get("username"),
+            actor_role=user.get("role"),
+            action="delete_course",
+            resource="/api/delete_course",
+            status="success",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details=deleted,
+        )
     return RedirectResponse(url="/courses", status_code=303)
 
 @app.get("/analysis")
-async def analysis_page(request: Request, user=Depends(login_required), db: Session = Depends(get_db)):
+async def analysis_page(request: Request, course_id: int = None, course_name: str = None, user=Depends(require_roles("admin", "teacher")), db: Session = Depends(get_db)):
     # 1. Total Records
-    total_records = db.query(Attendance).count()
+    attendance_query = db.query(Attendance)
+    if user.get("role") == "teacher":
+        teacher_key = user.get("full_name") or user.get("username")
+        teacher_courses = db.query(Course.course_id).filter(Course.teacher == teacher_key).all()
+        teacher_course_ids = [c[0] for c in teacher_courses]
+        attendance_query = attendance_query.filter(Attendance.course_id.in_(teacher_course_ids)) if teacher_course_ids else attendance_query.filter(False)
+
+    if not course_id and course_name:
+        c = (
+            db.query(Course.course_id)
+            .filter(Course.course_name == course_name)
+            .first()
+        )
+        course_id = c[0] if c else None
+    if course_id:
+        attendance_query = attendance_query.filter(Attendance.course_id == course_id)
+
+    total_records = attendance_query.count()
     
     # 2. Avg Rate (Mock or Simple Calc)
     # Let's use: (Total Attendance / (Total Students * 30 days)) * 100 ?
     # Or just simpler: Total Unique Students Attended Today / Total Students
     total_students = db.query(Student).count() or 1
     today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    today_att = db.query(Attendance.student_id).filter(Attendance.timestamp >= today_start).distinct().count()
+    today_att = (
+        attendance_query.with_entities(Attendance.student_id)
+        .filter(Attendance.check_time >= today_start)
+        .distinct()
+        .count()
+    )
     avg_rate = int((today_att / total_students) * 100)
     
     # 3. College Stats
-    colleges_stats = db.query(Student.college, func.count(Attendance.id)).join(Attendance).group_by(Student.college).all()
+    colleges_stats = (
+        db.query(Student.college, func.count(Attendance.record_id))
+        .join(Attendance, Attendance.student_id == Student.student_id)
+        .filter(Attendance.record_id.in_(attendance_query.with_entities(Attendance.record_id)))
+        .group_by(Student.college)
+        .all()
+    )
     col_names = [c[0] if c[0] else "Unknown" for c in colleges_stats]
     col_counts = [c[1] for c in colleges_stats]
     
     # 4. Low Attendance Warning
     # Find students with less than X attendances in last 30 days
     # Simplified: Get all students and their attendance count
-    results = db.query(Student, func.count(Attendance.id)).outerjoin(Attendance).group_by(Student.id).all()
+    results = (
+        db.query(Student, func.count(Attendance.record_id))
+        .outerjoin(Attendance, Attendance.student_id == Student.student_id)
+        .filter((Attendance.record_id == None) | (Attendance.record_id.in_(attendance_query.with_entities(Attendance.record_id))))
+        .group_by(Student.student_id)
+        .all()
+    )
     low_att_list = []
     for s, count in results:
         if count < 5: # Threshold
-            low_att_list.append({"name": s.name, "student_id": s.student_id or "-", "count": count})
+            low_att_list.append({"name": s.name, "student_id": s.student_no or "-", "count": count})
             
     return templates.TemplateResponse("analysis.html", {
         "request": request,
-        "user": {"username": user},
+        "user": user,
         "stats": {"avg_rate": avg_rate, "total_records": total_records},
         "chart_data": {"colleges": col_names, "counts": col_counts},
         "low_attendance": low_att_list,
@@ -330,19 +1142,62 @@ async def analysis_page(request: Request, user=Depends(login_required), db: Sess
     })
 
 @app.get("/api/export_attendance")
-async def export_attendance(user=Depends(login_required), db: Session = Depends(get_db)):
-    query = db.query(Attendance).join(Student).order_by(Attendance.timestamp.desc())
-    records = query.all()
+async def export_attendance(
+    request: Request,
+    college: str = None,
+    search_query: str = None,
+    course_id: int = None,
+    course_name: str = None,
+    start_date: str = None,
+    end_date: str = None,
+    user=Depends(require_roles("admin", "teacher")),
+    db: Session = Depends(get_db),
+):
+    if not course_id and course_name:
+        course_id = resolve_course_id(db, course_name)
+
+    teacher_course_ids = None
+    if user.get("role") == "teacher":
+        teacher_key = user.get("full_name") or user.get("username")
+        teacher_course_ids = get_teacher_course_ids(db, teacher_key)
+
+    start_time = None
+    end_time = None
+    if start_date:
+        try:
+            start_time = datetime.fromisoformat(start_date).replace(hour=0, minute=0, second=0, microsecond=0)
+        except Exception:
+            start_time = None
+    if end_date:
+        try:
+            end_time = datetime.fromisoformat(end_date).replace(hour=23, minute=59, second=59, microsecond=999999)
+        except Exception:
+            end_time = None
+
+    records = query_attendance_joined(
+        db,
+        course_id=course_id,
+        teacher_course_ids=teacher_course_ids,
+        college=college,
+        search_query=search_query,
+        start_time=start_time,
+        end_time=end_time,
+        limit=200000,
+    )
     
     data = []
-    for r in records:
+    for a, s, c in records:
+        course_label = c.course_name if c else "-"
+        ts = a.check_time
         data.append({
-            "姓名": r.student.name,
-            "学号": r.student.student_id,
-            "学院": r.student.college,
-            "班级": r.student.class_name,
-            "打卡时间": r.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            "状态": r.status
+            "姓名": s.name,
+            "学号": s.student_no or "-",
+            "学院": s.college,
+            "班级": s.class_name,
+            "课程": course_label,
+            "打卡时间": ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "-",
+            "置信度": a.confidence,
+            "状态": a.status
         })
         
     df = pd.DataFrame(data)
@@ -353,10 +1208,317 @@ async def export_attendance(user=Depends(login_required), db: Session = Depends(
     
     response = StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     response.headers["Content-Disposition"] = "attachment; filename=attendance_report.xlsx"
+    write_audit_log(
+        actor_username=user.get("username"),
+        actor_role=user.get("role"),
+        action="export_attendance",
+        resource="/api/export_attendance",
+        status="success",
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        details={
+            "college": college,
+            "search_query": search_query,
+            "course_id": course_id,
+            "course_name": course_name,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+    )
     return response
 
+
+@app.post("/api/delete_attendance")
+async def delete_attendance(
+    request: Request,
+    user=Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    form = await request.form()
+    raw_ids = form.getlist("ids") if form else []
+    ids = []
+    for x in raw_ids:
+        try:
+            ids.append(int(x))
+        except Exception:
+            pass
+    if not ids:
+        return RedirectResponse(url="/history", status_code=303)
+    deleted_count = db.query(Attendance).filter(Attendance.record_id.in_(ids)).delete(synchronize_session=False)
+    db.commit()
+    write_audit_log(
+        actor_username=user.get("username"),
+        actor_role=user.get("role"),
+        action="delete_attendance",
+        resource="/api/delete_attendance",
+        status="success",
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        details={"deleted_count": int(deleted_count), "ids": ids[:50]},
+    )
+    return RedirectResponse(url="/history", status_code=303)
+
+
+@app.get("/users")
+async def users_page(request: Request, user=Depends(require_roles("admin")), db: Session = Depends(get_db)):
+    error = request.query_params.get("error")
+    success = request.query_params.get("success")
+    accounts = db.query(UserAccount).order_by(UserAccount.created_at.desc()).all()
+    items = []
+    for a in accounts:
+        student_display = None
+        if a.student_id:
+            stu = db.query(Student).filter(Student.student_id == a.student_id).first()
+            if stu:
+                student_display = f"{stu.name}({stu.student_no or '-'})"
+        items.append(
+            {
+                "id": a.id,
+                "username": a.username,
+                "role": a.role,
+                "full_name": a.full_name,
+                "student_display": student_display,
+            }
+        )
+    return templates.TemplateResponse(
+        "users.html",
+        {"request": request, "user": user, "accounts": items, "error": error, "success": success, "title": "权限管理"},
+    )
+
+@app.get("/audit")
+async def audit_page(request: Request, user=Depends(require_roles("admin")), db: Session = Depends(get_db)):
+    rows = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(500).all()
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "id": r.id,
+                "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "-",
+                "actor_username": r.actor_username,
+                "actor_role": r.actor_role,
+                "action": r.action,
+                "resource": r.resource,
+                "status": r.status,
+                "ip": r.ip,
+            }
+        )
+    return templates.TemplateResponse(
+        "audit.html",
+        {"request": request, "user": user, "rows": items, "title": "审计日志"},
+    )
+
+
+@app.get("/api/audit/export")
+async def export_audit_logs(
+    request: Request,
+    ids: str = None,
+    user=Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    query = db.query(AuditLog)
+    selected_ids = []
+    if ids:
+        try:
+            selected_ids = [int(x) for x in ids.split(",") if x.strip().isdigit()]
+        except Exception:
+            selected_ids = []
+    if selected_ids:
+        query = query.filter(AuditLog.id.in_(selected_ids))
+    rows = query.order_by(AuditLog.created_at.desc()).limit(5000).all()
+
+    data = []
+    for r in rows:
+        data.append(
+            {
+                "时间": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else None,
+                "用户名": r.actor_username,
+                "角色": r.actor_role,
+                "动作": r.action,
+                "资源": r.resource,
+                "状态": r.status,
+                "IP": r.ip,
+                "User-Agent": r.user_agent,
+                "详情": r.details,
+            }
+        )
+    df = pd.DataFrame(data)
+    stream = io.BytesIO()
+    df.to_excel(stream, index=False)
+    stream.seek(0)
+
+    response = StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    response.headers["Content-Disposition"] = "attachment; filename=audit_logs.xlsx"
+    return response
+
+
+@app.post("/api/audit/delete")
+async def delete_audit_logs(
+    request: Request,
+    user=Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    form = await request.form()
+    raw_ids = form.getlist("ids") if form else []
+    ids = []
+    for x in raw_ids:
+        try:
+            ids.append(int(x))
+        except Exception:
+            pass
+    if not ids:
+        return RedirectResponse(url="/audit", status_code=303)
+    deleted_count = db.query(AuditLog).filter(AuditLog.id.in_(ids)).delete(synchronize_session=False)
+    db.commit()
+    return RedirectResponse(url="/audit", status_code=303)
+
+@app.post("/api/users")
+async def create_user(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    role: str = Form(...),
+    full_name: str = Form(None),
+    student_no: str = Form(None),
+    user=Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    role = role.strip().lower()
+    if role not in {"admin", "teacher", "student"}:
+        write_audit_log(
+            actor_username=user.get("username"),
+            actor_role=user.get("role"),
+            action="create_user",
+            resource="/api/users",
+            status="failed",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"username": username, "role": role, "reason": "invalid_role"},
+        )
+        return RedirectResponse(url="/users?error=角色无效", status_code=303)
+    if db.query(UserAccount).filter(UserAccount.username == username).first():
+        write_audit_log(
+            actor_username=user.get("username"),
+            actor_role=user.get("role"),
+            action="create_user",
+            resource="/api/users",
+            status="failed",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"username": username, "role": role, "reason": "username_exists"},
+        )
+        return RedirectResponse(url="/users?error=用户名已存在", status_code=303)
+    if username == "admin" and role != "admin":
+        write_audit_log(
+            actor_username=user.get("username"),
+            actor_role=user.get("role"),
+            action="create_user",
+            resource="/api/users",
+            status="failed",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"username": username, "role": role, "reason": "admin_reserved"},
+        )
+        return RedirectResponse(url="/users?error=admin账号仅允许管理员角色", status_code=303)
+
+    student_id = None
+    if role == "student":
+        if not student_no:
+            write_audit_log(
+                actor_username=user.get("username"),
+                actor_role=user.get("role"),
+                action="create_user",
+                resource="/api/users",
+                status="failed",
+                ip=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+                details={"username": username, "role": role, "reason": "missing_student_no"},
+            )
+            return RedirectResponse(url="/users?error=学生账号必须填写学号", status_code=303)
+        stu = (
+            db.query(Student)
+            .filter(Student.student_no == student_no)
+            .first()
+        )
+        if not stu:
+            write_audit_log(
+                actor_username=user.get("username"),
+                actor_role=user.get("role"),
+                action="create_user",
+                resource="/api/users",
+                status="failed",
+                ip=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+                details={"username": username, "role": role, "student_no": student_no, "reason": "student_not_found"},
+            )
+            return RedirectResponse(url="/users?error=未找到对应学号的学生信息", status_code=303)
+        student_id = stu.student_id
+
+    account = UserAccount(
+        username=username,
+        hashed_password=get_password_hash(password),
+        role=role,
+        full_name=full_name,
+        student_id=student_id,
+    )
+    db.add(account)
+    db.commit()
+    write_audit_log(
+        actor_username=user.get("username"),
+        actor_role=user.get("role"),
+        action="create_user",
+        resource="/api/users",
+        status="success",
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        details={"username": username, "role": role, "student_no": student_no},
+    )
+    return RedirectResponse(url="/users?success=账号创建成功", status_code=303)
+
+@app.post("/api/delete_user")
+async def delete_user(request: Request, user_id: int = Form(...), user=Depends(require_roles("admin")), db: Session = Depends(get_db)):
+    account = db.query(UserAccount).filter(UserAccount.id == user_id).first()
+    if not account:
+        write_audit_log(
+            actor_username=user.get("username"),
+            actor_role=user.get("role"),
+            action="delete_user",
+            resource="/api/delete_user",
+            status="failed",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"user_id": user_id, "reason": "not_found"},
+        )
+        return RedirectResponse(url="/users?error=账号不存在", status_code=303)
+    if account.username == "admin":
+        write_audit_log(
+            actor_username=user.get("username"),
+            actor_role=user.get("role"),
+            action="delete_user",
+            resource="/api/delete_user",
+            status="failed",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"user_id": user_id, "reason": "admin_protected"},
+        )
+        return RedirectResponse(url="/users?error=不能删除admin账号", status_code=303)
+    deleted_username = account.username
+    deleted_role = account.role
+    db.delete(account)
+    db.commit()
+    write_audit_log(
+        actor_username=user.get("username"),
+        actor_role=user.get("role"),
+        action="delete_user",
+        resource="/api/delete_user",
+        status="success",
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        details={"user_id": user_id, "username": deleted_username, "role": deleted_role},
+    )
+    return RedirectResponse(url="/users?success=账号已删除", status_code=303)
+
 @app.get("/settings")
-async def settings_page(request: Request, user=Depends(login_required)):
+async def settings_page(request: Request, user=Depends(require_roles("admin"))):
     # Scan for available models
     det_weights_dir = "models/weights/detection"
     rec_weights_dir = "models/weights/recognition"
@@ -378,52 +1540,96 @@ async def settings_page(request: Request, user=Depends(login_required)):
                 # e.g. AdaFace/best.pth
                 rec_models.append(f"{d}/{os.path.basename(pth)}")
                 
-    # Read current config
-    current_config = {}
-    if os.path.exists("config/config.yaml"):
-        with open("config/config.yaml", "r", encoding="utf-8") as f:
-            current_config = yaml.safe_load(f)
+    current_config = load_raw_config()
             
     return templates.TemplateResponse("settings.html", {
         "request": request,
-        "user": {"username": user},
+        "user": user,
         "det_models": det_models,
         "rec_models": rec_models,
         "config": current_config,
+        "runtime_settings": get_runtime_settings(),
         "title": "系统设置"
     })
 
 @app.post("/api/settings")
 async def update_settings(
+    request: Request,
     det_model: str = Form(...),
     rec_model: str = Form(...),
     similarity_threshold: float = Form(...),
-    user=Depends(login_required)
+    dedup_seconds: int = Form(60),
+    capture_width: int = Form(640),
+    capture_height: int = Form(480),
+    frame_interval_ms: int = Form(200),
+    jpeg_quality: float = Form(0.6),
+    max_inference_concurrency: int = Form(2),
+    max_ws_connections: int = Form(32),
+    force_https: bool = Form(False),
+    user=Depends(require_roles("admin"))
 ):
     try:
-        config_path = "config/config.yaml"
-        if not os.path.exists(config_path):
-             return {"status": "error", "message": "配置文件不存在"}
-             
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
+        config = load_raw_config()
             
         # Update Config
-        config['detector']['model_path'] = f"models/weights/detection/{det_model}"
-        config['recognition']['weights_path'] = f"models/weights/recognition/{rec_model}"
-        config['recognition']['similarity_threshold'] = similarity_threshold
+        config.setdefault("detector", {})
+        config.setdefault("recognition", {})
+        config.setdefault("attendance", {})
+        config.setdefault("capture", {})
+        config.setdefault("performance", {})
+        config.setdefault("security", {})
+        config["detector"]["model_path"] = f"models/weights/detection/{det_model}"
+        config["recognition"]["weights_path"] = f"models/weights/recognition/{rec_model}"
+        config["recognition"]["similarity_threshold"] = float(similarity_threshold)
+        config["attendance"]["dedup_seconds"] = int(dedup_seconds)
+        config["capture"]["width"] = int(capture_width)
+        config["capture"]["height"] = int(capture_height)
+        config["capture"]["frame_interval_ms"] = int(frame_interval_ms)
+        config["capture"]["jpeg_quality"] = float(jpeg_quality)
+        config["performance"]["max_inference_concurrency"] = int(max_inference_concurrency)
+        config["performance"]["max_ws_connections"] = int(max_ws_connections)
+        config["security"]["force_https"] = bool(force_https)
         
-        # Save Config
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.dump(config, f, allow_unicode=True)
+        save_raw_config(config)
             
         # Reload Service
         init_service()
+
+        write_audit_log(
+            actor_username=user.get("username"),
+            actor_role=user.get("role"),
+            action="update_settings",
+            resource="/api/settings",
+            status="success",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={
+                "det_model": det_model,
+                "rec_model": rec_model,
+                "similarity_threshold": float(similarity_threshold),
+                "dedup_seconds": int(dedup_seconds),
+                "capture": {
+                    "width": int(capture_width),
+                    "height": int(capture_height),
+                    "frame_interval_ms": int(frame_interval_ms),
+                    "jpeg_quality": float(jpeg_quality),
+                },
+                "performance": {
+                    "max_inference_concurrency": int(max_inference_concurrency),
+                    "max_ws_connections": int(max_ws_connections),
+                },
+                "security": {"force_https": bool(force_https)},
+            },
+        )
         
         return RedirectResponse(url="/settings?success=1", status_code=303)
         
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/runtime_settings")
+async def runtime_settings_api(user=Depends(login_required)):
+    return get_runtime_settings()
 
 # ... (Keep existing websocket and other APIs) ...
 
@@ -431,90 +1637,302 @@ async def update_settings(
 # --- APIs ---
 
 @app.websocket("/ws/stream")
-async def websocket_endpoint(websocket: WebSocket, db: Session = Depends(get_db)):
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    # Local session set for deduplication within a short time window
-    # In a real app, this should be more robust
-    recent_attendance = {} # {name: last_time}
-    
+    settings = get_runtime_settings()
+    max_ws = int(settings.get("performance", {}).get("max_ws_connections", 32))
+
+    async with app.state.ws_lock:
+        if app.state.active_ws >= max_ws:
+            await websocket.close(code=1013)
+            return
+        app.state.active_ws += 1
+
     try:
+        token = websocket.cookies.get("access_token")
+        principal = None
+        if token:
+            try:
+                payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                username = payload.get("sub")
+                role = payload.get("role")
+                full_name = payload.get("full_name")
+                if username and role:
+                    principal = {"username": username, "role": role, "full_name": full_name}
+            except JWTError:
+                principal = None
+
+        if not principal or principal.get("role") not in {"admin", "teacher"}:
+            await websocket.close(code=1008)
+            return
+
+        async def get_inference_semaphore():
+            cur = get_runtime_settings()
+            limit = int(cur.get("performance", {}).get("max_inference_concurrency", 2))
+            if not app.state.inference_semaphore or app.state.inference_semaphore_limit != limit:
+                app.state.inference_semaphore = asyncio.Semaphore(limit)
+                app.state.inference_semaphore_limit = limit
+            return app.state.inference_semaphore
+
+        def record_attendance_sync(student_name: str, course_id: int, confidence: float | None, now: datetime) -> bool:
+            db = SessionLocal()
+            try:
+                stu = db.query(Student).filter(Student.name == student_name).first()
+                if not stu:
+                    return False
+                course = db.query(Course).filter(Course.course_id == course_id).first()
+                if not course:
+                    return False
+                att = Attendance(
+                    student_id=stu.student_id,
+                    check_time=now,
+                    created_at=now,
+                    status="已签到",
+                    course_id=course.course_id,
+                    confidence=confidence,
+                )
+                db.add(att)
+                for i in range(3):
+                    try:
+                        db.commit()
+                        return True
+                    except IntegrityError:
+                        db.rollback()
+                        return False
+                    except OperationalError as e:
+                        db.rollback()
+                        if "locked" in str(e).lower() and i < 2:
+                            time.sleep(0.05 * (2**i))
+                            continue
+                        return False
+            finally:
+                db.close()
+
+        async def load_teacher_courses() -> set[int] | None:
+            if principal.get("role") != "teacher":
+                return None
+            teacher_name = principal.get("full_name") or principal.get("username")
+
+            def sync():
+                db = SessionLocal()
+                try:
+                    rows = db.query(Course.course_id).filter(Course.teacher == teacher_name).all()
+                    return {r[0] for r in rows}
+                finally:
+                    db.close()
+
+            return await asyncio.to_thread(sync)
+
+        def resolve_course_id_sync(course_name: str) -> int | None:
+            db = SessionLocal()
+            try:
+                row = (
+                    db.query(Course.course_id)
+                    .filter(Course.course_name == course_name)
+                    .first()
+                )
+                return row[0] if row else None
+            finally:
+                db.close()
+
+        teacher_course_ids = await load_teacher_courses()
+        name_to_student_id: dict[str, int] = {}
+        roster: dict[int, dict] = {}
+        roster_ids: set[int] = set()
+        last_stats_refresh = 0.0
+        cached_stats = {"expected": 0, "actual": 0, "absent_count": 0, "absent_list": []}
+
+        def resolve_student_id_sync(student_name: str) -> int | None:
+            db = SessionLocal()
+            try:
+                row = db.query(Student.student_id).filter(Student.name == student_name).first()
+                return row[0] if row else None
+            finally:
+                db.close()
+
+        def load_roster_sync():
+            db = SessionLocal()
+            try:
+                rows = db.query(Student.student_id, Student.student_no, Student.name).all()
+                return rows
+            finally:
+                db.close()
+
+        for sid, sno, sname in await asyncio.to_thread(load_roster_sync):
+            roster[int(sid)] = {"student_no": sno, "name": sname}
+            roster_ids.add(int(sid))
+        cached_stats["expected"] = len(roster_ids)
+
         while True:
-            data = await websocket.receive_text()
+            raw = await websocket.receive_text()
+            payload = None
+            if raw.strip().startswith("{"):
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    continue
+
+            data = payload.get("image") if isinstance(payload, dict) else raw
+            course_id = payload.get("course_id") if isinstance(payload, dict) else None
+            course_name = payload.get("course_name") if isinstance(payload, dict) else None
+            client_ts = payload.get("client_ts") if isinstance(payload, dict) else None
+
+            try:
+                course_id = int(course_id) if course_id not in (None, "") else None
+            except Exception:
+                course_id = None
+            try:
+                client_ts = int(client_ts) if client_ts not in (None, "") else None
+            except Exception:
+                client_ts = None
+
+            if not course_id and course_name:
+                course_id = await asyncio.to_thread(resolve_course_id_sync, course_name)
+
+            if teacher_course_ids is not None and (not course_id or course_id not in teacher_course_ids):
+                course_id = None
+
+            if not data:
+                continue
+
             if "," in data:
-                header, encoded = data.split(",", 1)
+                _, encoded = data.split(",", 1)
             else:
                 encoded = data
-                
-            image_data = base64.b64decode(encoded)
-            nparr = np.frombuffer(image_data, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
+
+            def decode_frame_sync(encoded_str: str):
+                image_data = base64.b64decode(encoded_str)
+                nparr = np.frombuffer(image_data, np.uint8)
+                return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            try:
+                frame = await asyncio.to_thread(decode_frame_sync, encoded)
+            except Exception:
+                continue
+
             if frame is None:
                 continue
-                
-            if service:
-                results = service.recognize_frame(frame)
-            else:
+
+            t0 = time.monotonic()
+            sem = await get_inference_semaphore()
+            try:
+                async with sem:
+                    results = await asyncio.to_thread(service.recognize_frame, frame) if service else []
+            except Exception:
                 results = []
-            
-            # Update Attendance
+            processing_ms = (time.monotonic() - t0) * 1000.0
+
             current_faces = []
-            attendance_count = 0
-            
+            now = datetime.now()
+            dedup_seconds = int(get_runtime_settings().get("attendance", {}).get("dedup_seconds", 60))
+
             for res in results:
-                name = res['name']
-                if name != "Unknown":
-                    # Record Attendance to DB
-                    now = datetime.now()
-                    if name not in recent_attendance or (now - recent_attendance[name]).seconds > 60:
-                        # Find student
-                        # We need to handle DB session inside WS loop carefully or use dependency
-                        # Since Depends doesn't work well inside WS loop for every frame, we create a new session or reuse logic
-                        # Simplified: Query by name (inefficient but works for small scale)
+                name = res.get("name")
+                if name and name != "Unknown":
+                    if principal.get("role") == "teacher" and not course_id:
+                        pass
+                    else:
+                        sid = name_to_student_id.get(name)
+                        if sid is None:
+                            sid = await asyncio.to_thread(resolve_student_id_sync, name)
+                            if sid:
+                                name_to_student_id[name] = sid
+                        if sid and course_id:
+                            key = (int(course_id), int(sid))
+                            async with app.state.dedup_lock:
+                                last = app.state.dedup_cache.get(key)
+                                if not last or (now - last).total_seconds() > dedup_seconds:
+                                    try:
+                                        app.state.attendance_queue.put_nowait(
+                                            {
+                                                "student_id": int(sid),
+                                                "course_id": int(course_id),
+                                                "confidence": res.get("score"),
+                                                "check_time": now,
+                                                "created_at": now,
+                                                "status": "已签到",
+                                            }
+                                        )
+                                        app.state.dedup_cache[key] = now
+                                    except Exception:
+                                        pass
+
+                current_faces.append(
+                    {
+                        "box": res.get("box"),
+                        "name": name,
+                        "score": res.get("score"),
+                    }
+                )
+
+            course_att = 0
+            if course_id:
+                async with app.state.dedup_lock:
+                    course_att = sum(1 for (cid, _), _t in app.state.dedup_cache.items() if cid == int(course_id))
+
+                if time.monotonic() - last_stats_refresh >= 2.0:
+                    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+                    def load_today_att_ids_sync(cid: int, start: datetime):
+                        db = SessionLocal()
                         try:
-                            # Re-get DB session as Depends closes it? No, Depends(get_db) works for the connection handling
-                            # But inside a loop, it's better to manage transaction scope
-                            stu = db.query(Student).filter(Student.name == name).first()
-                            if stu:
-                                att = Attendance(student_id=stu.id, timestamp=now, status="已签到")
-                                db.add(att)
-                                db.commit()
-                                recent_attendance[name] = now
-                        except Exception as e:
-                            print(f"Attendance DB Error: {e}")
-                            db.rollback()
-                
-                current_faces.append({
-                    "box": res['box'],
-                    "name": name,
-                    "score": res['score']
-                })
-            
-            # Get total distinct attendance count for today
-            # Simplified: just return length of recent_attendance cache
-            attendance_count = len(recent_attendance)
-            
-            await websocket.send_json({
-                "faces": current_faces,
-                "attendance_count": attendance_count
-            })
-            
-    except Exception as e:
-        pass
+                            rows = (
+                                db.query(Attendance.student_id)
+                                .filter(Attendance.course_id == cid, Attendance.check_time >= start)
+                                .distinct()
+                                .all()
+                            )
+                            return [r[0] for r in rows]
+                        finally:
+                            db.close()
+
+                    ids = await asyncio.to_thread(load_today_att_ids_sync, int(course_id), today_start)
+                    actual_ids = {int(x) for x in ids if x is not None}
+                    absent_ids = roster_ids - actual_ids
+                    absent_list = []
+                    for sid in list(absent_ids)[:50]:
+                        info = roster.get(int(sid))
+                        if info:
+                            absent_list.append(info)
+                    cached_stats = {
+                        "expected": len(roster_ids),
+                        "actual": len(actual_ids),
+                        "absent_count": len(absent_ids),
+                        "absent_list": absent_list,
+                    }
+                    last_stats_refresh = time.monotonic()
+
+            await websocket.send_json(
+                {
+                    "faces": current_faces,
+                    "attendance_count": course_att,
+                    "expected_count": cached_stats["expected"],
+                    "actual_count": cached_stats["actual"],
+                    "absent_count": cached_stats["absent_count"],
+                    "absent_list": cached_stats["absent_list"],
+                    "client_ts": client_ts,
+                    "server_ts": int(time.time() * 1000),
+                    "processing_ms": float(processing_ms),
+                }
+            )
     finally:
+        async with app.state.ws_lock:
+            app.state.active_ws = max(0, app.state.active_ws - 1)
         try:
             await websocket.close()
-        except:
+        except Exception:
             pass
 
 @app.post("/api/register")
 async def register_face(
+    request: Request,
     name: str = Form(...), 
-    student_id: str = Form(None),
+    student_no: str = Form(None),
     college: str = Form(None),
     gender: str = Form(None),
     class_name: str = Form(None),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    user=Depends(require_roles("admin"))
 ):
     if not service:
         return {"status": "error", "message": "服务未初始化"}
@@ -523,40 +1941,42 @@ async def register_face(
     faces_dir = "data/faces"
     os.makedirs(faces_dir, exist_ok=True)
     
-    # Save permanent file
-    ext = os.path.splitext(file.filename)[1]
-    file_path = os.path.join(faces_dir, f"{name}{ext}")
-    
     try:
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
-        
-        # Register in Service (In-Memory) & DB
-        # Note: service.register_person only takes basic args, we need to handle DB update here or modify service
-        # Let's modify the DB logic directly here for full fields support, 
-        # OR update service.register_person to accept **kwargs.
-        # For simplicity, let's update service.register_person signature in next step.
-        # But wait, service.register_person calls DB inside. Let's pass a dict or modify it.
-        
-        # Actually, let's do it cleanly:
-        # 1. Extract features (Service)
-        feats = service.process_image(file_path)
+        raw_bytes = await file.read()
+        nparr = np.frombuffer(raw_bytes, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if image is None:
+            return {"status": "error", "message": "图片解码失败"}
+
+        feats = service.process_image(image)
         if not feats:
-            if os.path.exists(file_path): os.remove(file_path)
             return {"status": "error", "message": "未检测到人脸"}
             
-        # 2. Update In-Memory Cache
+        key = (student_no or name or "face").strip()
+        safe = "".join(ch for ch in key if ch.isalnum() or ch in {"-", "_"})
+        if not safe:
+            safe = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+        file_path = os.path.join(faces_dir, f"{safe}.enc")
+        with open(file_path, "wb") as f:
+            f.write(encrypt_bytes(raw_bytes))
+
         service.known_faces[name] = feats[0]
         
-        # 3. Save to DB
+        embedding_raw = feats[0].detach().cpu().numpy().astype(np.float32).tobytes()
+        embedding_enc = encrypt_to_b64(embedding_raw)
+
         db = SessionLocal()
         try:
-            student = db.query(Student).filter(Student.name == name).first()
+            student = None
+            if student_no:
+                student = db.query(Student).filter(Student.student_no == student_no).first()
+            if not student:
+                student = db.query(Student).filter(Student.name == name).first()
             if not student:
                 student = Student(
                     name=name, 
                     face_image_path=file_path, 
-                    student_id=student_id,
+                    student_no=student_no or name,
                     college=college,
                     gender=gender,
                     class_name=class_name
@@ -564,12 +1984,24 @@ async def register_face(
                 db.add(student)
             else:
                 student.face_image_path = file_path
-                if student_id: student.student_id = student_id
+                if student_no:
+                    student.student_no = student_no
                 if college: student.college = college
                 if gender: student.gender = gender
                 if class_name: student.class_name = class_name
+            student.face_embedding_enc = embedding_enc
             
             db.commit()
+            write_audit_log(
+                actor_username=user.get("username"),
+                actor_role=user.get("role"),
+                action="register_face",
+                resource="/api/register",
+                status="success",
+                ip=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+                details={"name": name, "student_no": student_no, "college": college, "gender": gender, "class_name": class_name},
+            )
         finally:
             db.close()
         
@@ -579,10 +2011,13 @@ async def register_face(
         return {"status": "error", "message": str(e)}
 
 @app.post("/api/delete_student")
-async def delete_student(student_id: int = Form(...), db: Session = Depends(get_db)):
+async def delete_student(request: Request, student_id: int = Form(...), db: Session = Depends(get_db), user=Depends(require_roles("admin"))):
     try:
-        stu = db.query(Student).filter(Student.id == student_id).first()
+        stu = db.query(Student).filter(Student.student_id == student_id).first()
         if stu:
+            deleted = {"student_id": stu.student_id, "name": stu.name, "student_no": stu.student_no}
+            db.query(UserAccount).filter(UserAccount.student_id == student_id).update({"student_id": None})
+            db.query(Attendance).filter(Attendance.student_id == student_id).delete(synchronize_session=False)
             # Delete file
             if stu.face_image_path and os.path.exists(stu.face_image_path):
                 os.remove(stu.face_image_path)
@@ -594,13 +2029,169 @@ async def delete_student(student_id: int = Form(...), db: Session = Depends(get_
             # Remove from memory cache
             if service and stu.name in service.known_faces:
                 del service.known_faces[stu.name]
+            write_audit_log(
+                actor_username=user.get("username"),
+                actor_role=user.get("role"),
+                action="delete_student",
+                resource="/api/delete_student",
+                status="success",
+                ip=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+                details=deleted,
+            )
                 
         return RedirectResponse(url="/students", status_code=303)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+@app.get("/api/student_face")
+async def student_face(student_id: int, db: Session = Depends(get_db), user=Depends(require_roles("admin"))):
+    stu = db.query(Student).filter(Student.student_id == student_id).first()
+    if not stu or not stu.face_image_path:
+        raise HTTPException(status_code=404, detail="未找到照片")
+    if not os.path.exists(stu.face_image_path):
+        raise HTTPException(status_code=404, detail="照片文件不存在")
+    try:
+        token = open(stu.face_image_path, "rb").read()
+        raw = decrypt_bytes(token)
+    except Exception:
+        raise HTTPException(status_code=500, detail="照片解密失败")
+    media_type = "application/octet-stream"
+    if raw.startswith(b"\xff\xd8"):
+        media_type = "image/jpeg"
+    elif raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        media_type = "image/png"
+    return Response(content=raw, media_type=media_type)
+
+
+@app.post("/api/update_student")
+async def update_student(
+    request: Request,
+    student_id: int = Form(...),
+    student_no: str = Form(...),
+    name: str = Form(...),
+    gender: str = Form(None),
+    class_name: str = Form(None),
+    college: str = Form(None),
+    file: UploadFile = File(None),
+    user=Depends(require_roles("admin")),
+):
+    if not service:
+        return {"status": "error", "message": "服务未初始化"}
+
+    db = SessionLocal()
+    try:
+        stu = db.query(Student).filter(Student.student_id == student_id).first()
+        if not stu:
+            return {"status": "error", "message": "学生不存在"}
+
+        old_name = stu.name
+        stu.student_no = (student_no or "").strip()
+        stu.name = (name or "").strip()
+        stu.gender = (gender or "").strip() or None
+        stu.class_name = (class_name or "").strip() or None
+        stu.college = (college or "").strip() or None
+
+        if file and getattr(file, "filename", None):
+            raw_bytes = await file.read()
+            nparr = np.frombuffer(raw_bytes, np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if image is None:
+                return {"status": "error", "message": "图片解码失败"}
+            feats = service.process_image(image)
+            if not feats:
+                return {"status": "error", "message": "未检测到人脸"}
+
+            faces_dir = "data/faces"
+            os.makedirs(faces_dir, exist_ok=True)
+            key = (stu.student_no or stu.name or "face").strip()
+            safe = "".join(ch for ch in key if ch.isalnum() or ch in {"-", "_"})
+            if not safe:
+                safe = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+            file_path = os.path.join(faces_dir, f"{safe}.enc")
+            with open(file_path, "wb") as f:
+                f.write(encrypt_bytes(raw_bytes))
+
+            stu.face_image_path = file_path
+            embedding_raw = feats[0].detach().cpu().numpy().astype(np.float32).tobytes()
+            stu.face_embedding_enc = encrypt_to_b64(embedding_raw)
+            service.known_faces[stu.name] = feats[0]
+
+        if old_name != stu.name and service:
+            if old_name in service.known_faces and stu.name not in service.known_faces:
+                service.known_faces[stu.name] = service.known_faces.pop(old_name)
+
+        db.commit()
+        write_audit_log(
+            actor_username=user.get("username"),
+            actor_role=user.get("role"),
+            action="update_student",
+            resource="/api/update_student",
+            status="success",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"student_id": student_id, "student_no": stu.student_no, "name": stu.name},
+        )
+        return RedirectResponse(url="/students", status_code=303)
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "message": str(e)}
+    finally:
+        db.close()
+
+
+@app.get("/api/export_students")
+async def export_students(
+    request: Request,
+    class_name: str = None,
+    search_query: str = None,
+    user=Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    from sqlalchemy import or_
+
+    query = db.query(Student)
+    if class_name:
+        query = query.filter(Student.class_name == class_name)
+    if search_query:
+        q = search_query.strip()
+        if q:
+            query = query.filter(or_(Student.name.like(f"%{q}%"), Student.student_no.like(f"%{q}%")))
+    rows = query.order_by(Student.created_at.desc()).all()
+
+    data = []
+    for s in rows:
+        data.append(
+            {
+                "学号": s.student_no,
+                "姓名": s.name,
+                "班级": s.class_name,
+                "性别": s.gender,
+                "学院": s.college,
+                "注册时间": s.created_at.strftime("%Y-%m-%d %H:%M:%S") if s.created_at else None,
+            }
+        )
+    df = pd.DataFrame(data)
+    stream = io.BytesIO()
+    df.to_excel(stream, index=False)
+    stream.seek(0)
+
+    response = StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    response.headers["Content-Disposition"] = "attachment; filename=students.xlsx"
+    write_audit_log(
+        actor_username=user.get("username"),
+        actor_role=user.get("role"),
+        action="export_students",
+        resource="/api/export_students",
+        status="success",
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        details={"class_name": class_name, "search_query": search_query},
+    )
+    return response
+
 @app.post("/api/import_students")
-async def import_students(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def import_students(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db), user=Depends(require_roles("admin"))):
     try:
         contents = await file.read()
         df = pd.read_excel(contents)
@@ -616,12 +2207,12 @@ async def import_students(file: UploadFile = File(...), db: Session = Depends(ge
             student_id = str(row['学号']).strip()
             
             # Skip if exists (by student_id)
-            if db.query(Student).filter(Student.student_id == student_id).first():
+            if db.query(Student).filter(Student.student_no == student_id).first():
                 continue
                 
             new_student = Student(
                 name=name,
-                student_id=student_id,
+                student_no=student_id,
                 gender=str(row['性别']).strip(),
                 class_name=str(row['班级']).strip(),
                 college=str(row['学院']).strip(),
@@ -631,6 +2222,16 @@ async def import_students(file: UploadFile = File(...), db: Session = Depends(ge
             count += 1
             
         db.commit()
+        write_audit_log(
+            actor_username=user.get("username"),
+            actor_role=user.get("role"),
+            action="import_students",
+            resource="/api/import_students",
+            status="success",
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            details={"imported_count": count},
+        )
         return RedirectResponse(url="/students", status_code=303)
     except Exception as e:
         return {"status": "error", "message": f"导入失败: {str(e)}"}

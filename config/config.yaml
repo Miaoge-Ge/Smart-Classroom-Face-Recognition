@@ -21,3 +21,15 @@ recognition:
   embedding_size: 512
   similarity_threshold: 0.5
   weights_path: models/weights/recognition/resnet50/AdaFace.pth
+attendance:
+  dedup_seconds: 60
+capture:
+  width: 1280
+  height: 720
+  frame_interval_ms: 33
+  jpeg_quality: 0.7
+performance:
+  max_inference_concurrency: 2
+  max_ws_connections: 32
+security:
+  force_https: false

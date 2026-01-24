@@ -14,6 +14,12 @@ from core.models import Student, Attendance
 from core.database import SessionLocal
 from datetime import datetime
 
+try:
+    from core.crypto_manager import decrypt_bytes, decrypt_from_b64, encrypt_to_b64
+    _crypto_ok = True
+except Exception:
+    _crypto_ok = False
+
 class FaceRecognitionService:
     def __init__(self, config=None):
         """
@@ -71,22 +77,55 @@ class FaceRecognitionService:
         try:
             students = db.query(Student).all()
             for s in students:
-                if s.face_image_path and os.path.exists(s.face_image_path):
-                    # In a real system, we might cache features in DB too.
-                    # Here we re-extract from image to ensure consistency or load from disk.
-                    # For performance, saving embedding blobs in DB is better.
-                    # For this demo, we re-process image.
+                if not s.name:
+                    continue
+
+                if _crypto_ok and getattr(s, "face_embedding_enc", None):
                     try:
+                        raw = decrypt_from_b64(s.face_embedding_enc)
+                        vec = np.frombuffer(raw, dtype=np.float32)
+                        if vec.size > 0:
+                            t = torch.from_numpy(vec).to(self.device)
+                            self.known_faces[s.name] = t
+                            continue
+                    except Exception:
+                        pass
+
+                if not s.face_image_path:
+                    continue
+
+                try:
+                    if _crypto_ok and str(s.face_image_path).endswith(".enc") and os.path.exists(s.face_image_path):
+                        with open(s.face_image_path, "rb") as f:
+                            enc = f.read()
+                        plain = decrypt_bytes(enc)
+                        nparr = np.frombuffer(plain, np.uint8)
+                        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        if image is None:
+                            continue
+                        feats = self.process_image(image)
+                    else:
+                        if not os.path.exists(s.face_image_path):
+                            continue
                         feats = self.process_image(s.face_image_path)
-                        if feats:
-                            self.known_faces[s.name] = feats[0]
-                    except Exception as e:
-                        print(f"Error loading face for {s.name}: {e}")
+
+                    if feats:
+                        self.known_faces[s.name] = feats[0]
+                        if _crypto_ok and not getattr(s, "face_embedding_enc", None):
+                            try:
+                                raw = feats[0].detach().cpu().numpy().astype(np.float32).tobytes()
+                                s.face_embedding_enc = encrypt_to_b64(raw)
+                                db.add(s)
+                                db.commit()
+                            except Exception:
+                                db.rollback()
+                except Exception as e:
+                    print(f"Error loading face for {s.name}: {e}")
             print(f"Loaded {len(self.known_faces)} faces from database.")
         finally:
             db.close()
 
-    def register_person(self, name, image_input, student_id=None):
+    def register_person(self, name, image_input, student_no=None):
         """
         注册已知人脸到数据库
         :param name: 姓名
@@ -103,11 +142,12 @@ class FaceRecognitionService:
                 # Check if exists
                 student = db.query(Student).filter(Student.name == name).first()
                 if not student:
-                    student = Student(name=name, face_image_path=image_input, student_id=student_id)
+                    student = Student(name=name, student_no=student_no or name, face_image_path=image_input)
                     db.add(student)
                 else:
                     student.face_image_path = image_input # Update photo
-                    if student_id: student.student_id = student_id
+                    if student_no:
+                        student.student_no = student_no
                 
                 db.commit()
                 print(f"Registered user: {name} in DB")
