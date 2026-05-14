@@ -8,7 +8,7 @@ capture:
 detector:
   conf_threshold: 0.1
   device: auto
-  model_path: models/weights/detection/yolo11n-pose.pt
+  model_path: models/weights/detection/yolo-swa.pt
   model_type: yolo
 performance:
   max_inference_concurrency: 6
@@ -28,7 +28,7 @@ preprocess:
 recognition:
   device: auto
   embedding_size: 512
-  similarity_threshold: 0.75
-  weights_path: models/weights/recognition/resnet50/AdaFace.pth
+  similarity_threshold: 0.6
+  weights_path: models/weights/recognition/nexnet/cosface.pth
 security:
   force_https: false
