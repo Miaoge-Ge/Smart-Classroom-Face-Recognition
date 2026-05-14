@@ -1,28 +1,29 @@
 """
-人脸注册与识别实验
+人脸识别脚本 —— 加载预注册的人脸数据，对 test/faces/ 目录下的图片进行识别并标注。
 
-用法：python test/test.py
+用法：python test/recognize.py
 """
 
 import sys
 import os
-from PIL import Image, ImageDraw, ImageFont
+import torch
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 # ============================================================
-# 实验配置
+# 配置
 # ============================================================
-REGISTER_DIR = "test/face"        # 注册用人脸图片目录（每张图一张人脸）
-RECOGNIZE_DIR = "test/faces"      # 待识别图片目录（可含多人脸）
-OUTPUT_DIR = "test/output"        # 标注结果输出目录
-DET_THRESHOLD = 0.01              # YOLO 人脸检测置信度阈值
-DET_IMGSZ = 1280                  # YOLO 检测输入图片尺寸
-REC_THRESHOLD = 0.6               # 人脸识别余弦相似度阈值
-IOU_THRESHOLD = 0.4               # IOU 去重阈值
+FACE_DATA_FILE = "test/face_data.pth"
+RECOGNIZE_DIR = "test/faces"
+OUTPUT_DIR = "test/output"
+DET_THRESHOLD = 0.01
+DET_IMGSZ = 1280
+REC_THRESHOLD = 0.6
+IOU_THRESHOLD = 0.4
 MODEL_PATH = "models/weights/recognition/nexnet/arcface.pth"
 # ============================================================
 
@@ -54,6 +55,28 @@ def _iter_images(dir_path: str):
         ext = os.path.splitext(f)[1].lower()
         if ext in IMAGE_EXTENSIONS:
             yield os.path.join(dir_path, f)
+
+
+def _iou(box_a, box_b):
+    xa = max(box_a[0], box_b[0])
+    ya = max(box_a[1], box_b[1])
+    xb = min(box_a[2], box_b[2])
+    yb = min(box_a[3], box_b[3])
+    inter = max(0, xb - xa) * max(0, yb - ya)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    return inter / (area_a + area_b - inter + 1e-8)
+
+
+def _dedup_by_iou(results, threshold):
+    if len(results) <= 1:
+        return results
+    sorted_results = sorted(results, key=lambda r: r["score"], reverse=True)
+    keep = []
+    for r in sorted_results:
+        if all(_iou(r["box"], k["box"]) < threshold for k in keep):
+            keep.append(r)
+    return keep
 
 
 def draw_annotations(image_bgr, faces, font):
@@ -91,44 +114,29 @@ def draw_annotations(image_bgr, faces, font):
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
-def _iou(box_a, box_b):
-    """计算两个边界框的 IOU"""
-    xa = max(box_a[0], box_b[0])
-    ya = max(box_a[1], box_b[1])
-    xb = min(box_a[2], box_b[2])
-    yb = min(box_a[3], box_b[3])
-    inter = max(0, xb - xa) * max(0, yb - ya)
-    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
-    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
-    return inter / (area_a + area_b - inter + 1e-8)
-
-
-def _dedup_by_iou(results, threshold):
-    """按 IOU 去重，保留分数高的"""
-    if len(results) <= 1:
-        return results
-    # 按 score 降序排列
-    sorted_results = sorted(results, key=lambda r: r["score"], reverse=True)
-    keep = []
-    for r in sorted_results:
-        if all(_iou(r["box"], k["box"]) < threshold for k in keep):
-            keep.append(r)
-    return keep
-
-
 def main():
-    register_dir = _resolve_dir(REGISTER_DIR)
+    face_data_file = _resolve_dir(FACE_DATA_FILE)
     recognize_dir = _resolve_dir(RECOGNIZE_DIR)
     output_dir = _resolve_dir(OUTPUT_DIR)
 
-    for d, label in [(register_dir, "注册目录"), (recognize_dir, "识别目录")]:
-        if not os.path.isdir(d):
-            print(f"[错误] {label}不存在: {d}")
-            return
+    if not os.path.isfile(face_data_file):
+        print(f"[错误] 人脸数据文件不存在: {face_data_file}")
+        print(f"请先运行 python test/register.py 注册人脸")
+        return
+
+    if not os.path.isdir(recognize_dir):
+        print(f"[错误] 识别目录不存在: {recognize_dir}")
+        return
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # ---- 初始化 ----
+    # ---- 加载预注册的人脸数据 ----
+    data = torch.load(face_data_file, map_location="cpu", weights_only=False)
+    known_faces = data["known_faces"]
+    student_labels = data["student_labels"]
+    print(f"已加载 {len(known_faces)} 个注册人脸")
+
+    # ---- 初始化服务 ----
     from services.face_service import FaceRecognitionService
     FaceRecognitionService._load_faces_from_db = lambda self: None
 
@@ -138,15 +146,16 @@ def main():
         os.path.join(PROJECT_ROOT, MODEL_PATH)
     )
 
-    model_name = os.path.splitext(os.path.basename(MODEL_PATH))[0]
-    print(f"模型: {model_name}  识别阈值: {REC_THRESHOLD}")
-
     service = FaceRecognitionService(config=cfg)
     service.detector.conf_threshold = DET_THRESHOLD
     service.similarity_threshold = REC_THRESHOLD
     service.detector.model.overrides["imgsz"] = DET_IMGSZ
 
-    # 两阶段：检测用 imgsz=1280，关键点用 imgsz=640
+    # 将预注册的人脸数据注入 service
+    service.known_faces = {sid: feat.to(service.device) for sid, feat in known_faces.items()}
+    service.student_labels = dict(student_labels)
+
+    # 两阶段检测补丁
     _original_detect_faces = service.detector.detect_faces
     _REF_RES = 640
 
@@ -200,35 +209,6 @@ def main():
 
     service.detector.detect_faces = _patched_detect_faces
 
-    # ---- 注册 ----
-    print(f"\n{'注册阶段':─^40}")
-    registered = 0
-    next_id = 1000
-    failed = []
-
-    for img_path in _iter_images(register_dir):
-        name = os.path.splitext(os.path.basename(img_path))[0]
-        try:
-            features = service.process_image(img_path)
-            if not features:
-                failed.append(name)
-                continue
-            feature = features[0].detach()
-            service.upsert_known_face(next_id, name, feature, student_no=None)
-            registered += 1
-            next_id += 1
-        except Exception as e:
-            failed.append(f"{name}({e})")
-
-    print(f"  成功 {registered} 人", end="")
-    if failed:
-        print(f"  失败 {len(failed)}: {', '.join(failed)}", end="")
-    print()
-
-    if registered == 0:
-        print("[错误] 未注册任何人脸，请检查 REGISTER_DIR 下是否有图片文件。")
-        return
-
     # ---- 识别 ----
     print(f"\n{'识别结果':─^40}")
     font = _load_font(36)
@@ -244,13 +224,11 @@ def main():
             print(f"  {basename}  无法读取")
             continue
 
-        # 自定义识别流程：检测 → 提特征 → 排他性匹配
         detections = service.detector.detect_faces(image, align=True, output_size=112)
         if not detections:
             print(f"  {basename}  未检测到人脸")
             continue
 
-        # 提取每张人脸的特征
         face_features = []
         for det in detections:
             aligned = det.get("aligned_face")
@@ -261,7 +239,6 @@ def main():
             feat = service.extract_feature(Image.fromarray(rgb))
             face_features.append(feat)
 
-        # 每张面孔独立匹配最佳身份（不排他，不同面孔可以匹配同一身份）
         results = []
         for i, feat in enumerate(face_features):
             if feat is None:
@@ -287,7 +264,6 @@ def main():
                     "score": float(best_score),
                 })
 
-        # IOU 去重
         results = _dedup_by_iou(results, IOU_THRESHOLD)
 
         known_list = [(r["name"], r["score"]) for r in results if r["name"] != "Unknown"]
@@ -307,7 +283,6 @@ def main():
             scores_str = " ".join(f"[{s:.2f}]" for s in sorted(unknown_list, reverse=True))
             print(f"    未知: {scores_str}")
 
-        # 保存标注图
         annotated = draw_annotations(image, results, font)
         out_path = os.path.join(output_dir, f"{stem}_annotated{ext}")
         cv2.imwrite(out_path, annotated)
