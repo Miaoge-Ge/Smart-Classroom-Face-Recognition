@@ -133,9 +133,7 @@ def _ensure_csrf_token(request: Request) -> str:
     return token or generate_csrf_token()
 
 
-_RECOGNITION_MODEL_DIR_ALIASES = {
-    "fastcontextface": "nexnet",
-}
+_RECOGNITION_MODEL_DIR_ALIASES = {}
 
 
 def _normalize_recognition_model_choice(model_choice: str | None) -> str | None:
@@ -1973,6 +1971,7 @@ async def update_settings(
     capture_height: int = Form(480),
     frame_interval_ms: int = Form(200),
     jpeg_quality: float = Form(0.6),
+    capture_brightness: float = Form(1.15),
     max_inference_concurrency: int = Form(2),
     max_ws_connections: int = Form(32),
     force_https: bool = Form(False),
@@ -2003,6 +2002,7 @@ async def update_settings(
         config["capture"]["height"] = int(capture_height)
         config["capture"]["frame_interval_ms"] = int(frame_interval_ms)
         config["capture"]["jpeg_quality"] = float(jpeg_quality)
+        config["capture"]["brightness"] = float(capture_brightness)
         config["performance"]["max_inference_concurrency"] = int(max_inference_concurrency)
         config["performance"]["max_ws_connections"] = int(max_ws_connections)
         config["security"]["force_https"] = bool(force_https)
@@ -2030,6 +2030,7 @@ async def update_settings(
                     "height": int(capture_height),
                     "frame_interval_ms": int(frame_interval_ms),
                     "jpeg_quality": float(jpeg_quality),
+                    "brightness": float(capture_brightness),
                 },
                 "performance": {
                     "max_inference_concurrency": int(max_inference_concurrency),

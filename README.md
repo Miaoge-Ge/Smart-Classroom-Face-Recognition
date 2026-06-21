@@ -59,7 +59,7 @@
 | 后端框架 | Python 3.12, FastAPI, Uvicorn, Jinja2 |
 | 数据库 | SQLite (WAL 模式, 外键约束, busy_timeout), SQLAlchemy 2.0 |
 | 人脸检测 | YOLOv8/v9/v11/v12 Pose & Face 模型 (Ultralytics) |
-| 人脸识别 | ResNet10, ResNet50, NexNet (FastContextFace) + ArcFace/CosFace/AdaFace 权重 |
+| 人脸识别 | ResNet10, ResNet50, NexNet + ArcFace/CosFace/AdaFace 权重 |
 | 前端 | HTML5, Bootstrap 5 (AdminLTE), Chart.js, FontAwesome |
 | 安全 | python-jose (JWT), bcrypt, cryptography (Fernet), CSRF 中间件 |
 | 异步 | asyncio, WebSocket, 基于队列的批量考勤写入 |
@@ -82,7 +82,7 @@ systems/
 │   ├── runtime_settings.py      # 热重载配置读取器
 │   └── model_factory.py         # 骨干网络工厂
 ├── models/
-│   ├── backbones/               # ResNet, NexNet, FastContextFace
+│   ├── backbones/               # ResNet, NexNet
 │   ├── detectors/               # YOLO 检测器封装
 │   └── weights/                 # 模型权重文件
 ├── services/
@@ -222,7 +222,7 @@ An industrial-grade face recognition attendance system for educational environme
 | Backend | Python 3.12, FastAPI, Uvicorn, Jinja2 |
 | Database | SQLite (WAL mode), SQLAlchemy 2.0 |
 | Detection | YOLOv8/v9/v11/v12 Pose & Face (Ultralytics) |
-| Recognition | ResNet10, ResNet50, NexNet (FastContextFace) with ArcFace/CosFace/AdaFace |
+| Recognition | ResNet10, ResNet50, NexNet with ArcFace/CosFace/AdaFace |
 | Frontend | HTML5, Bootstrap 5 (AdminLTE), Chart.js, FontAwesome |
 | Security | JWT, bcrypt, Fernet encryption, CSRF middleware |
 

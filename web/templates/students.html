@@ -294,7 +294,9 @@ document.addEventListener('DOMContentLoaded', () => {
         regCanvas.width = previewWidth;
         regCanvas.height = previewHeight;
         const ctx = regCanvas.getContext('2d');
+        ctx.filter = 'brightness(1.15)';
         ctx.drawImage(regVideo, sx, sy, sWidth, sHeight, 0, 0, previewWidth, previewHeight);
+        ctx.filter = 'none';
     }
 
     function captureRegistrationPhoto() {
@@ -340,6 +342,31 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
+    async function applyCameraTuning(s) {
+        const tracks = (s || stream) ? (s || stream).getVideoTracks() : [];
+        if (!tracks || !tracks[0]) return;
+        const track = tracks[0];
+        try {
+            const caps = track.getCapabilities ? track.getCapabilities() : null;
+            if (!caps) return;
+            const advanced = {};
+            if (caps.exposureMode && caps.exposureMode.includes('continuous')) {
+                advanced.exposureMode = 'continuous';
+            }
+            if (caps.brightness) {
+                advanced.brightness = caps.brightness.max;
+            }
+            if (caps.exposureCompensation && caps.exposureCompensation.max > 0) {
+                advanced.exposureCompensation = Math.min(2, caps.exposureCompensation.max);
+            }
+            if (Object.keys(advanced).length > 0) {
+                await track.applyConstraints({ advanced: [advanced] });
+            }
+        } catch (e) {
+            console.warn('Camera tuning not supported:', e.message || e);
+        }
+    }
+
     cameraModal.addEventListener('shown.bs.modal', async () => {
         try {
             cameraReady = false;
@@ -353,6 +380,8 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             regVideo.srcObject = stream;
             regVideo.play().catch(() => {});
+
+            applyCameraTuning(stream);
 
             window.setTimeout(() => {
                 if (!cameraReady && stream && regVideo.videoWidth && regVideo.videoHeight) {

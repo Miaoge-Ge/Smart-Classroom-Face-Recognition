@@ -93,3 +93,6 @@ temppp/
 *.mp4
 *.avi
 *.mkv
+
+# Test outputs (generated annotated images)
+test/output/

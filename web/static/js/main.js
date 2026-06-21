@@ -27,7 +27,7 @@ if (canvas) {
     let lastProcessingMs = null;
 
     let runtimeSettings = {
-        capture: { width: 1280, height: 720, frame_interval_ms: 33, jpeg_quality: 0.7 }
+        capture: { width: 1280, height: 720, frame_interval_ms: 33, jpeg_quality: 0.7, brightness: 1.15 }
     };
 
     let wsState = 'DISCONNECTED';
@@ -157,6 +157,31 @@ if (canvas) {
         stream = null;
     }
 
+    async function applyCameraTuning(s) {
+        const tracks = (s || stream) ? (s || stream).getVideoTracks() : [];
+        if (!tracks || !tracks[0]) return;
+        const track = tracks[0];
+        try {
+            const caps = track.getCapabilities ? track.getCapabilities() : null;
+            if (!caps) return;
+            const advanced = {};
+            if (caps.exposureMode && caps.exposureMode.includes('continuous')) {
+                advanced.exposureMode = 'continuous';
+            }
+            if (caps.brightness) {
+                advanced.brightness = caps.brightness.max;
+            }
+            if (caps.exposureCompensation && caps.exposureCompensation.max > 0) {
+                advanced.exposureCompensation = Math.min(2, caps.exposureCompensation.max);
+            }
+            if (Object.keys(advanced).length > 0) {
+                await track.applyConstraints({ advanced: [advanced] });
+            }
+        } catch (e) {
+            console.warn('Camera tuning not supported:', e.message || e);
+        }
+    }
+
     async function openStream(deviceId) {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             throw new Error("Browser does not support getUserMedia");
@@ -229,6 +254,8 @@ if (canvas) {
                 stopCamera();
             };
         }
+
+        applyCameraTuning(stream);
     }
 
     function connectWebSocket() {
@@ -332,7 +359,10 @@ if (canvas) {
             tempCanvas.height = height;
         }
 
+        const brightness = runtimeSettings.capture.brightness ?? 1.15;
+        tempCtx.filter = `brightness(${brightness})`;
         tempCtx.drawImage(video, 0, 0, width, height);
+        tempCtx.filter = 'none';
         const jpegQuality = runtimeSettings.capture.jpeg_quality ?? 0.7;
         const dataURL = tempCanvas.toDataURL('image/jpeg', jpegQuality);
         const courseId = courseSelect ? courseSelect.value : '';

@@ -73,6 +73,7 @@ def get_runtime_settings(config_path: str = "config/config.yaml") -> dict:
             "height": safe_int(capture_cfg.get("height", 720), 720),
             "frame_interval_ms": safe_int(capture_cfg.get("frame_interval_ms", 33), 33),
             "jpeg_quality": safe_float(capture_cfg.get("jpeg_quality", 0.7), 0.7),
+            "brightness": safe_float(capture_cfg.get("brightness", 1.15), 1.15),
         },
         "performance": {
             "max_inference_concurrency": safe_int(perf_cfg.get("max_inference_concurrency", 2), 2),

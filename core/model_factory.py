@@ -10,7 +10,6 @@ class ModelFactory:
         'resnet10': ResNet10,
         'resnet50': ResNet50,
         'nexnet': nexnet,
-        'fastcontextface': nexnet,
     }
 
     @classmethod

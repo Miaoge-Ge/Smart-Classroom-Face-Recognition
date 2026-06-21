@@ -22,9 +22,7 @@ try:
 except Exception:
     _crypto_ok = False
 
-_LEGACY_RECOGNITION_DIR_ALIASES = {
-    "fastcontextface": "nexnet",
-}
+_LEGACY_RECOGNITION_DIR_ALIASES = {}
 
 
 def _normalize_backbone_type(backbone_type: str | None) -> str | None:
@@ -72,7 +70,7 @@ def _infer_backbone_type_from_weights_path(weights_path: str | None) -> str | No
         return "resnet50"
     if "/recognition/resnet10/" in p:
         return "resnet10"
-    if "/recognition/nexnet/" in p or "/recognition/fastcontextface/" in p:
+    if "/recognition/nexnet/" in p:
         return "nexnet"
     return None
 

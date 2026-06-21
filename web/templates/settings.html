@@ -95,6 +95,11 @@
                                     <small class="text-muted">压缩率越高越清晰但网络占用更大</small>
                                 </div>
                                 <div class="col-md-6">
+                                    <label class="form-label fw-semibold">画面亮度调整</label>
+                                    <input type="number" step="0.05" min="0.5" max="2.0" class="form-control" name="capture_brightness" value="{{ runtime_settings.capture.brightness }}">
+                                    <small class="text-muted">摄像头画面偏暗时可调大，1.0=原始亮度，1.15=增亮15%</small>
+                                </div>
+                                <div class="col-md-6">
                                     <label class="form-label fw-semibold">最大推理并发</label>
                                     <input type="number" min="1" max="16" class="form-control" name="max_inference_concurrency" value="{{ runtime_settings.performance.max_inference_concurrency }}">
                                     <small class="text-muted">同时处理的视频流越多可适当增大，但会提升算力占用</small>
